@@ -18,6 +18,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Check chart appVersion matches tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          app="$(sed -nE 's/^appVersion: *"?([^"]+)"?$/\1/p' charts/cloudflare-exporter/Chart.yaml)"
+          if [ "$app" != "$tag" ]; then
+            echo "Chart.yaml appVersion is '$app' but tag is '$tag' — run: make bump VERSION=$tag, commit, re-tag" >&2
+            exit 1
+          fi
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser

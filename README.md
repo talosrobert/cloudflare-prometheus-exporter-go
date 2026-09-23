@@ -259,3 +259,15 @@ make build   # go build
 make test    # go test ./...
 make lint    # gofmt, go vet, golangci-lint
 ```
+
+## Releasing
+
+Binary releases are cut by GoReleaser when a `v*` tag is pushed. The Helm chart's
+`appVersion` must match that tag (it's the default `image.tag`), and the release workflow
+fails if it doesn't, so bump the chart first:
+
+```sh
+make bump VERSION=0.2.0          # sets version and appVersion in charts/cloudflare-exporter/Chart.yaml
+git commit -am "release v0.2.0"
+git tag v0.2.0 && git push origin main v0.2.0
+```
