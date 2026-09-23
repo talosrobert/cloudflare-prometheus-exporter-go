@@ -42,6 +42,7 @@ func run(logger *slog.Logger) error {
 	analyticsWindow := flag.Duration("analytics-window", time.Minute, "trailing time range of HTTP analytics summed per scrape")
 	analyticsLag := flag.Duration("analytics-lag", 5*time.Minute, "how far behind now the analytics window ends, to allow for Cloudflare ingestion delay")
 	queryLimit := flag.Int("query-limit", 10000, "max GraphQL result rows requested per zone")
+	excludeHost := flag.Bool("exclude-host", false, "drop the host label from cloudflare_zone_requests_customer_error, trading detail for lower cardinality")
 	showVersion := flag.Bool("version", false, "print the exporter version and exit")
 	flag.Parse()
 
@@ -71,6 +72,7 @@ func run(logger *slog.Logger) error {
 		Lag:           *analyticsLag,
 		QueryLimit:    *queryLimit,
 		ScrapeTimeout: cfg.Server.ScrapeTimeout,
+		ExcludeHost:   *excludeHost,
 	}, logger)
 
 	registry := prometheus.NewRegistry()

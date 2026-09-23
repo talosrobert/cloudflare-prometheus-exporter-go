@@ -23,6 +23,9 @@ exporter:
   queryLimit: 10000
   metricsPath: /metrics
   scrapeTimeout: 30s
+  # Drops the host label from cloudflare_zone_requests_customer_error — that
+  # label is high cardinality on zones serving many hostnames.
+  excludeHost: false
   # Rendered as-is into config.yaml's discovery.jobs; see the main README for
   # the searchTags/accounts shape.
   discovery:

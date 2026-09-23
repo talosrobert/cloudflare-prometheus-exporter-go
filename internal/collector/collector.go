@@ -46,6 +46,7 @@ type cloudflareClient interface {
 	FetchHTTPMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.ZoneHTTPMetrics, error)
 	FetchWAFMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.WAFEventGroup, error)
 	FetchDNSMetrics(ctx context.Context, accountID string, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.DNSQueryGroup, error)
+	FetchErrorMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.ErrorGroup, error)
 }
 
 // Options tune how a Collector queries Cloudflare.
@@ -59,6 +60,9 @@ type Options struct {
 	QueryLimit int
 	// ScrapeTimeout bounds one whole Collect call across all jobs.
 	ScrapeTimeout time.Duration
+	// ExcludeHost drops the host label from cloudflare_zone_requests_customer_error,
+	// trading detail for lower cardinality on multi-hostname zones.
+	ExcludeHost bool
 }
 
 // Collector orchestrates discovery jobs and turns their results into
@@ -117,6 +121,11 @@ type Collector struct {
 	wafEventsRuleDesc    *prometheus.Desc
 	wafEventsCountryDesc *prometheus.Desc
 	wafTruncatedDesc     *prometheus.Desc
+
+	customerErrorDesc          *prometheus.Desc
+	errorRatioDesc             *prometheus.Desc
+	originResponseDurationDesc *prometheus.Desc
+	errorTruncatedDesc         *prometheus.Desc
 }
 
 // New builds a Collector for the given discovery jobs.
@@ -181,7 +190,23 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 		wafEventsRuleDesc:    desc("zone_firewall_events_rule", windowHelp("Firewall/WAF events by rule ID — high cardinality, one series per distinct rule seen in the window"), withLabel(zoneLabels, "rule_id")),
 		wafEventsCountryDesc: desc("zone_firewall_events_country", windowHelp("Firewall/WAF events by client country"), withLabel(zoneLabels, "country")),
 		wafTruncatedDesc:     desc("zone_firewall_result_truncated", "1 if the zone's WAF event result hit the query limit, meaning WAF metrics are undercounted", zoneLabels),
+
+		customerErrorDesc:          desc("zone_requests_customer_error", windowHelp("Requests with an edge 4xx/5xx response, by status, country, and host — high cardinality, disable the host label with -exclude-host"), customerErrorLabels(opts)),
+		errorRatioDesc:             desc("zone_error_ratio", windowHelp("4xx/5xx error ratio, by side: edge (errors / total requests) or origin (errors / requests that reached the origin, excluding edge cache hits, edge blocks, and other requests never sent to the origin)"), withLabel(zoneLabels, "side")),
+		originResponseDurationDesc: desc("zone_origin_response_duration_seconds", windowHelp("Average origin response duration, weighted by request count, across requests that reached the origin"), zoneLabels),
+		errorTruncatedDesc:         desc("zone_error_result_truncated", "1 if the zone's error/latency analytics result hit the query limit, meaning error metrics are undercounted", zoneLabels),
 	}
+}
+
+// customerErrorLabels drops the host label when opts.ExcludeHost is set —
+// label sets are fixed for a Desc's lifetime, so this is decided once here,
+// not per scrape.
+func customerErrorLabels(opts Options) []string {
+	labels := withLabel(zoneLabels, "status", "country")
+	if !opts.ExcludeHost {
+		labels = withLabel(labels, "host")
+	}
+	return labels
 }
 
 // Describe implements prometheus.Collector.
@@ -204,6 +229,7 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 		c.threatsCountryDesc, c.threatsTypeDesc, c.pageviewsDesc, c.uniquesDesc, c.cacheHitRatioDesc,
 		c.dnsQueriesDesc, c.dnsQueriesTypeDesc, c.dnsQueriesResponseCodeDesc, c.dnsTruncatedDesc, c.dnsUnmatchedDesc,
 		c.wafEventsDesc, c.wafEventsActionDesc, c.wafEventsSourceDesc, c.wafEventsRuleDesc, c.wafEventsCountryDesc, c.wafTruncatedDesc,
+		c.customerErrorDesc, c.errorRatioDesc, c.originResponseDurationDesc, c.errorTruncatedDesc,
 	}
 }
 
@@ -387,6 +413,15 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 	}
 	c.emitWAFMetrics(ch, zoneByID, wafGroups, c.opts.QueryLimit)
 
+	// httpRequestsAdaptiveGroups needs no permission beyond what HTTP analytics
+	// already requires (verified live), so a failure here is fatal for the
+	// account just like FetchHTTPMetrics/FetchWAFMetrics.
+	errorGroups, err := c.cf.FetchErrorMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+	if err != nil {
+		return err
+	}
+	c.emitErrorMetrics(ch, zoneByID, errorGroups, c.opts.QueryLimit, c.opts.ExcludeHost)
+
 	// DNS analytics needs its own API token permission that Cloudflare does not
 	// clearly document, so a token good enough for everything else still gets
 	// "not authorized for that account" here. Treat it as non-fatal: record it
@@ -481,6 +516,80 @@ func (c *Collector) emitWAFMetrics(ch chan<- prometheus.Metric, zoneByID map[str
 	}
 }
 
+// customerErrorKey groups a customer-facing (edge) error count by zone,
+// status, and country, plus host unless -exclude-host is set — in which case
+// every row's host is folded into "" before it reaches this key, so counts
+// for different hosts merge correctly instead of colliding as duplicate
+// series once the host label is dropped at emit time.
+type customerErrorKey struct{ zoneID, status, country, host string }
+
+// emitErrorMetrics aggregates httpRequestsAdaptiveGroups rows by zone.
+// originResponseStatus is 0 for rows the origin was never contacted for, so
+// those rows are excluded from every origin-side aggregate (error ratio,
+// duration) rather than diluting them with non-origin traffic; the edge-side
+// error ratio is computed separately in emitZoneMetrics from data already
+// fetched via httpRequests1mGroups, at no extra API cost.
+func (c *Collector) emitErrorMetrics(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, groups []cloudflareapi.ErrorGroup, queryLimit int, excludeHost bool) {
+	rowCount := make(map[string]int)
+	customerErrors := make(map[customerErrorKey]float64)
+	originTotal := make(map[string]float64)
+	originErrors := make(map[string]float64)
+	durationWeightedSum := make(map[string]float64)
+	durationWeightedCount := make(map[string]float64)
+
+	for _, g := range groups {
+		zoneID := g.ZoneTag
+		if _, inScope := zoneByID[zoneID]; !inScope {
+			continue
+		}
+		rowCount[zoneID]++
+
+		if g.EdgeStatus >= 400 {
+			host := g.Host
+			if excludeHost {
+				host = ""
+			}
+			customerErrors[customerErrorKey{zoneID, strconv.Itoa(g.EdgeStatus), g.Country, host}] += g.Count
+		}
+
+		if g.OriginStatus > 0 {
+			originTotal[zoneID] += g.Count
+			if g.OriginStatus >= 400 {
+				originErrors[zoneID] += g.Count
+			}
+			durationWeightedSum[zoneID] += g.AvgOriginDurationMs * g.Count
+			durationWeightedCount[zoneID] += g.Count
+		}
+	}
+
+	for zoneID, zone := range zoneByID {
+		truncated := 0.0
+		if rowCount[zoneID] > 0 && rowCount[zoneID] >= queryLimit {
+			c.logger.Warn("error/latency analytics result hit query limit, metrics are undercounted",
+				"zone_id", zoneID, "query_limit", queryLimit)
+			truncated = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.errorTruncatedDesc, prometheus.GaugeValue, truncated, zone.ID, zone.Name)
+
+		if total := originTotal[zoneID]; total > 0 {
+			ch <- prometheus.MustNewConstMetric(c.errorRatioDesc, prometheus.GaugeValue, originErrors[zoneID]/total, zone.ID, zone.Name, "origin")
+		}
+		if weight := durationWeightedCount[zoneID]; weight > 0 {
+			avgSeconds := durationWeightedSum[zoneID] / weight / 1000
+			ch <- prometheus.MustNewConstMetric(c.originResponseDurationDesc, prometheus.GaugeValue, avgSeconds, zone.ID, zone.Name)
+		}
+	}
+
+	for key, count := range customerErrors {
+		zone := zoneByID[key.zoneID]
+		labels := []string{zone.ID, zone.Name, key.status, key.country}
+		if !excludeHost {
+			labels = append(labels, key.host)
+		}
+		ch <- prometheus.MustNewConstMetric(c.customerErrorDesc, prometheus.GaugeValue, count, labels...)
+	}
+}
+
 type dnsZoneKey struct{ zoneID, label string }
 
 // emitDNSMetrics aggregates DNS rows per in-scope zone and returns the rows
@@ -551,11 +660,18 @@ func (c *Collector) emitZoneMetrics(ch chan<- prometheus.Metric, zone cloudflare
 	}
 
 	statusTotals := make(map[string]float64)
+	edgeErrors := 0.0
 	for _, st := range sum.ResponseStatusMap {
 		statusTotals[strconv.Itoa(st.EdgeResponseStatus)] += st.Requests
+		if st.EdgeResponseStatus >= 400 {
+			edgeErrors += st.Requests
+		}
 	}
 	for status, count := range statusTotals {
 		gauge(c.requestsStatusDesc, count, status)
+	}
+	if sum.Requests > 0 {
+		gauge(c.errorRatioDesc, edgeErrors/sum.Requests, "edge")
 	}
 
 	for _, b := range sum.BrowserMap {

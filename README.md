@@ -59,6 +59,7 @@ Command-line flags (all optional):
 | `-analytics-window` | `1m` | Time range each analytics metric is summed over per scrape |
 | `-analytics-lag` | `5m` | How far behind "now" the window ends, allowing for Cloudflare's ingestion delay |
 | `-query-limit` | `10000` | Max GraphQL result rows requested per zone |
+| `-exclude-host` | `false` | Drop the `host` label from `cloudflare_zone_requests_customer_error` — trades detail for lower cardinality on multi-hostname zones |
 
 ## Metrics
 
@@ -107,6 +108,12 @@ Labels on every zone metric: `zone_id`, `zone`.
 | `cloudflare_zone_firewall_events_rule` | `rule_id` | Firewall/WAF events by rule ID — **high cardinality**, one series per distinct rule seen in the window |
 | `cloudflare_zone_firewall_events_country` | `country` | Firewall/WAF events by client country |
 | `cloudflare_zone_firewall_result_truncated` | (zone labels) | 1 if that zone's WAF event result hit `-query-limit` in this scrape |
+| `cloudflare_zone_requests_customer_error` | `status`, `country`, `host`* | Requests with an edge 4xx/5xx response — **high cardinality**, one series per distinct (status, country, host) combination seen in the window; drop the `host` label with `-exclude-host` |
+| `cloudflare_zone_error_ratio` | `side` | 4xx/5xx error ratio, by side: `edge` (edge 4xx/5xx responses / total requests) or `origin` (origin 4xx/5xx responses / requests that reached the origin, excludes edge cache hits, edge blocks, and anything else never sent to the origin) |
+| `cloudflare_zone_origin_response_duration_seconds` | | Average origin response duration, weighted by request count, across requests that reached the origin |
+| `cloudflare_zone_error_result_truncated` | (zone labels) | 1 if that zone's error/latency analytics result hit `-query-limit` in this scrape |
+
+\* `host` is omitted when `-exclude-host` is set; matching rows are merged instead of dropped.
 
 Exporter self-metrics:
 
@@ -128,6 +135,29 @@ or hardcoded here — this exporter could not sample real event data with
 non-empty `source` values during development, so guessing a filter value
 risked silently returning zero rows. Use `source` as a label in PromQL instead
 of expecting this exporter to pre-filter by product.
+
+### Origin vs. edge errors
+
+`cloudflare_zone_error_ratio{side="origin"}` and `cloudflare_zone_origin_response_duration_seconds`
+only consider requests that actually reached the origin. Cloudflare reports an origin status
+of `0` for requests it never forwarded — edge cache hits, edge/WAF blocks, redirects, and the
+like — and those rows are excluded rather than counted as origin successes, which would
+otherwise dilute both metrics with traffic the origin never saw. `cloudflare_zone_error_ratio{side="edge"}`
+has no such exclusion: it's edge 4xx/5xx over all requests, from the same data already used
+for `cloudflare_zone_requests_status`, at no extra API cost.
+
+### Sampling
+
+Cloudflare's `*Adaptive*` datasets — behind the WAF, DNS, and error/latency metrics here —
+are [adaptively sampled](https://developers.cloudflare.com/analytics/sampling/): under load,
+only a fraction of events is stored, and each stored event carries a `sampleInterval` (the
+reciprocal of its inclusion probability). The raw `count` in those datasets is the number of
+*sampled records*, so this exporter reports `count × avg(sampleInterval)` per group — the
+same estimate Cloudflare's own dashboard shows. Verified live: a low-traffic zone already
+returned a group with `count=44502` and `sampleInterval≈1.18`, i.e. ~18% more real requests
+than the raw count. The HTTP request metrics come from `httpRequests1mGroups`, a
+non-sampled rollup, and are exact. The `*_result_truncated` gauges count raw rows against
+`-query-limit`, unaffected by sampling.
 
 ### Partial-permission behaviour
 

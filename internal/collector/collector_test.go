@@ -23,10 +23,11 @@ type fakeClient struct {
 	zones    map[string][]cloudflareapi.Zone
 	// tags is keyed by account ID; the fake applies filters by requiring
 	// every filter key to be present with the given value.
-	tags      map[string]map[string]map[string]string
-	metrics   map[string]cloudflareapi.ZoneHTTPMetrics
-	dnsGroups []cloudflareapi.DNSQueryGroup
-	wafGroups []cloudflareapi.WAFEventGroup
+	tags        map[string]map[string]map[string]string
+	metrics     map[string]cloudflareapi.ZoneHTTPMetrics
+	dnsGroups   []cloudflareapi.DNSQueryGroup
+	wafGroups   []cloudflareapi.WAFEventGroup
+	errorGroups []cloudflareapi.ErrorGroup
 
 	listZonesCalls int
 }
@@ -98,6 +99,20 @@ func (f *fakeClient) FetchDNSMetrics(_ context.Context, _ string, zoneIDs []stri
 	return out, nil
 }
 
+func (f *fakeClient) FetchErrorMetrics(_ context.Context, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.ErrorGroup, error) {
+	wanted := make(map[string]bool, len(zoneIDs))
+	for _, id := range zoneIDs {
+		wanted[id] = true
+	}
+	var out []cloudflareapi.ErrorGroup
+	for _, g := range f.errorGroups {
+		if wanted[g.ZoneTag] {
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
 func newTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -111,6 +126,14 @@ func newFake() *fakeClient {
 	prod := cloudflareapi.ZoneHTTPMetrics{ZoneTag: "zone-prod", HasData: true}
 	prod.Group.Sum.Requests = 100
 	prod.Group.Sum.CachedRequests = 25
+	prod.Group.Sum.ResponseStatusMap = []struct {
+		EdgeResponseStatus int     `json:"edgeResponseStatus"`
+		Requests           float64 `json:"requests"`
+	}{
+		{EdgeResponseStatus: 200, Requests: 75},
+		{EdgeResponseStatus: 404, Requests: 15},
+		{EdgeResponseStatus: 500, Requests: 10},
+	}
 	return &fakeClient{
 		accounts: []cloudflareapi.Account{acct},
 		zones: map[string][]cloudflareapi.Zone{
@@ -131,6 +154,17 @@ func newFake() *fakeClient {
 		wafGroups: []cloudflareapi.WAFEventGroup{
 			{ZoneTag: "zone-prod", Action: "block", Source: "waf", RuleID: "rule-1", Country: "US", Count: 5},
 			{ZoneTag: "zone-prod", Action: "challenge", Source: "botManagement", RuleID: "", Country: "DE", Count: 2},
+		},
+		errorGroups: []cloudflareapi.ErrorGroup{
+			// edge and origin both error.
+			{ZoneTag: "zone-prod", EdgeStatus: 500, OriginStatus: 500, Country: "US", Host: "prod.example.com", Count: 3, AvgOriginDurationMs: 120},
+			// edge served from cache (200) but the origin itself errored.
+			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 502, Country: "DE", Host: "prod.example.com", Count: 2, AvgOriginDurationMs: 80},
+			// edge-blocked request, origin never contacted: OriginStatus 0 and
+			// AvgOriginDurationMs -1 must be excluded from origin aggregates.
+			{ZoneTag: "zone-prod", EdgeStatus: 403, OriginStatus: 0, Country: "FR", Host: "prod.example.com", Count: 5, AvgOriginDurationMs: -1},
+			// fully healthy request.
+			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 200, Country: "US", Host: "prod.example.com", Count: 10, AvgOriginDurationMs: 50},
 		},
 	}
 }
@@ -186,6 +220,32 @@ func hasLabel(m *dto.Metric, name, value string) bool {
 		}
 	}
 	return false
+}
+
+// metricValue returns the gauge value of the one series in families' named
+// family whose labels are an exact match for want (same keys and values,
+// nothing extra), and whether such a series was found.
+func metricValue(families []*dto.MetricFamily, name string, want map[string]string) (float64, bool) {
+	mf := findFamily(families, name)
+	if mf == nil {
+		return 0, false
+	}
+	for _, m := range mf.GetMetric() {
+		if len(m.GetLabel()) != len(want) {
+			continue
+		}
+		match := true
+		for k, v := range want {
+			if !hasLabel(m, k, v) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return m.GetGauge().GetValue(), true
+		}
+	}
+	return 0, false
 }
 
 func TestCollector_TagFiltering(t *testing.T) {
@@ -608,4 +668,178 @@ type failingZones struct{ *fakeClient }
 
 func (f *failingZones) ListZones(_ context.Context, _ string) ([]cloudflareapi.Zone, error) {
 	return nil, context.DeadlineExceeded
+}
+
+// error_ratio{side="edge"} must come from the httpRequests1mGroups status map
+// that's already fetched for cloudflare_zone_requests_status, at no extra API
+// cost: 15+10 of 100 requests were edge 4xx/5xx in newFake()'s baseline data.
+func TestCollector_EdgeErrorRatio(t *testing.T) {
+	c := New(newFake(), []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+	got, ok := metricValue(out, "cloudflare_zone_error_ratio", map[string]string{"zone": "prod.example.com", "zone_id": "zone-prod", "side": "edge"})
+	if !ok {
+		t.Fatal("expected an error_ratio{side=edge} series for zone-prod")
+	}
+	if want := 0.25; got != want {
+		t.Errorf("error_ratio{side=edge} = %v, want %v", got, want)
+	}
+}
+
+// Origin-side aggregates must exclude rows where the origin was never
+// contacted (OriginStatus 0): newFake() has one such row (403/0, count 5)
+// alongside three origin-contacted rows (500, 502, 200; counts 3, 2, 10).
+func TestCollector_OriginErrorMetrics(t *testing.T) {
+	c := New(newFake(), []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+
+	wantZone := map[string]string{"zone": "prod.example.com", "zone_id": "zone-prod"}
+	wantOriginZone := map[string]string{"zone": "prod.example.com", "zone_id": "zone-prod", "side": "origin"}
+	if got, ok := metricValue(out, "cloudflare_zone_error_ratio", wantOriginZone); !ok {
+		t.Error("expected an error_ratio{side=origin} series for zone-prod")
+	} else if want := 5.0 / 15.0; got != want {
+		t.Errorf("error_ratio{side=origin} = %v, want %v", got, want)
+	}
+
+	// weighted mean: (120*3 + 80*2 + 50*10) / 15 = 68ms = 0.068s.
+	if got, ok := metricValue(out, "cloudflare_zone_origin_response_duration_seconds", wantZone); !ok {
+		t.Error("expected an origin_response_duration_seconds series for zone-prod")
+	} else if want := 0.068; got != want {
+		t.Errorf("origin_response_duration_seconds = %v, want %v", got, want)
+	}
+
+	if got, ok := metricValue(out, "cloudflare_zone_error_result_truncated", wantZone); !ok {
+		t.Error("expected an error_result_truncated series for zone-prod")
+	} else if got != 0 {
+		t.Errorf("error_result_truncated = %v, want 0", got)
+	}
+}
+
+// The customer-error metric counts edge 4xx/5xx requests by status/country/host
+// — newFake()'s two edge-error rows (500/US/prod.example.com count 3,
+// 403/FR/prod.example.com count 5) must appear; its two non-error rows must not.
+func TestCollector_CustomerErrorMetrics(t *testing.T) {
+	c := New(newFake(), []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+	cases := []struct {
+		status, country string
+		want            float64
+	}{
+		{"500", "US", 3},
+		{"403", "FR", 5},
+	}
+	for _, tc := range cases {
+		got, ok := metricValue(out, "cloudflare_zone_requests_customer_error", map[string]string{
+			"zone": "prod.example.com", "zone_id": "zone-prod", "status": tc.status, "country": tc.country, "host": "prod.example.com",
+		})
+		if !ok {
+			t.Errorf("expected a customer_error series for status=%s country=%s", tc.status, tc.country)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("customer_error{status=%s,country=%s} = %v, want %v", tc.status, tc.country, got, tc.want)
+		}
+	}
+	if hasSeries(out, "cloudflare_zone_requests_customer_error", map[string]string{"status": "200"}) {
+		t.Error("non-error edge status must not produce a customer_error series")
+	}
+}
+
+// -exclude-host must drop the host label and merge counts from different
+// hosts into one series instead of producing duplicate label sets (which
+// would fail the whole scrape on a pedantic registry).
+func TestCollector_CustomerErrorExcludeHost(t *testing.T) {
+	fc := newFake()
+	fc.errorGroups = append(fc.errorGroups,
+		cloudflareapi.ErrorGroup{ZoneTag: "zone-prod", EdgeStatus: 500, OriginStatus: 500, Country: "US", Host: "other.example.com", Count: 4, AvgOriginDurationMs: 10},
+	)
+	opts := testOptions()
+	opts.ExcludeHost = true
+	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+
+	out := gather(t, c) // pedantic Gather() would fail here if host-dropping produced duplicate series.
+
+	mf := findFamily(out, "cloudflare_zone_requests_customer_error")
+	if mf == nil {
+		t.Fatal("expected a customer_error family")
+	}
+	for _, m := range mf.GetMetric() {
+		for _, l := range m.GetLabel() {
+			if l.GetName() == "host" {
+				t.Errorf("host label must be absent when ExcludeHost is set, got %+v", m)
+			}
+		}
+	}
+	// The two 500/US rows (counts 3 and 4, originally different hosts) must
+	// merge into a single count-7 series once the host label is dropped.
+	got, ok := metricValue(out, "cloudflare_zone_requests_customer_error", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "status": "500", "country": "US",
+	})
+	if !ok {
+		t.Fatal("expected a merged 500/US customer_error series")
+	}
+	if want := 7.0; got != want {
+		t.Errorf("merged customer_error{status=500,country=US} = %v, want %v", got, want)
+	}
+}
+
+// Cloudflare truncates group results at the limit with no indication, so the
+// exporter must flag it, same as the WAF/DNS truncation gauges.
+func TestCollector_ErrorTruncationFlagged(t *testing.T) {
+	fc := newFake()
+	opts := testOptions()
+	opts.QueryLimit = len(fc.errorGroups)
+	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+
+	out := gather(t, c)
+	got, ok := metricValue(out, "cloudflare_zone_error_result_truncated", map[string]string{"zone": "prod.example.com", "zone_id": "zone-prod"})
+	if !ok {
+		t.Fatal("expected an error_result_truncated series for zone-prod")
+	}
+	if got != 1 {
+		t.Errorf("error_result_truncated = %v, want 1", got)
+	}
+
+	opts.QueryLimit = len(fc.errorGroups) + 1
+	c = New(newFake(), []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+	out = gather(t, c)
+	got, ok = metricValue(out, "cloudflare_zone_error_result_truncated", map[string]string{"zone": "prod.example.com", "zone_id": "zone-prod"})
+	if !ok {
+		t.Fatal("expected an error_result_truncated series for zone-prod")
+	}
+	if got != 0 {
+		t.Errorf("error_result_truncated = %v, want 0", got)
+	}
+}
+
+type failingError struct{ *fakeClient }
+
+func (f *failingError) FetchErrorMetrics(_ context.Context, _ []string, _, _ time.Time, _ int) ([]cloudflareapi.ErrorGroup, error) {
+	return nil, errors.New("graphql error")
+}
+
+// An error-metrics fetch failure must be fatal like WAF/HTTP, not tolerated
+// like DNS/tags — same two-account technique as TestCollector_WAFErrorIsFatal
+// to make the difference observable.
+func TestCollector_ErrorMetricsErrorIsFatal(t *testing.T) {
+	acct2 := cloudflareapi.Account{ID: "acct2", Name: "Account Two"}
+	fc := newFake()
+	fc.accounts = append(fc.accounts, acct2)
+	fc.zones["acct2"] = []cloudflareapi.Zone{
+		{ID: "zone-other", Name: "other.example.com", Status: "active", Account: acct2},
+	}
+	c := New(&failingError{fakeClient: fc}, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+	if hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": "other.example.com"}) {
+		t.Error("acct2 must never be reached once acct1's error-metrics fetch fails fatally")
+	}
+	if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("all")); got != 0 {
+		t.Errorf("job_success = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(c.scrapeErrors.WithLabelValues("all")); got != 1 {
+		t.Errorf("scrape_errors_total = %v, want 1", got)
+	}
 }

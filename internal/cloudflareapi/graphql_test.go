@@ -91,7 +91,7 @@ func TestClient_FetchDNSMetrics(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"data":{"viewer":{"accounts":[{"dnsAnalyticsAdaptiveGroups":[
 			{"count":10,"dimensions":{"zoneTag":"zone-1","queryType":"A","responseCode":"NOERROR"}},
-			{"count":1,"dimensions":{"zoneTag":"zone-1","queryType":"A","responseCode":"NXDOMAIN"}}
+			{"count":1,"avg":{"sampleInterval":3},"dimensions":{"zoneTag":"zone-1","queryType":"A","responseCode":"NXDOMAIN"}}
 		]}]}}}`))
 	})
 
@@ -102,8 +102,13 @@ func TestClient_FetchDNSMetrics(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("got %d groups, want 2: %+v", len(got), got)
 	}
+	// No avg block at all: taken at face value.
 	if got[0].Count != 10 || got[0].QueryType != "A" || got[0].ResponseCode != "NOERROR" {
 		t.Errorf("unexpected first group: %+v", got[0])
+	}
+	// One sampled record standing for three queries.
+	if got[1].Count != 3 {
+		t.Errorf("sampled group Count = %v, want 3 (1 record × sampleInterval 3)", got[1].Count)
 	}
 }
 
@@ -117,8 +122,8 @@ func TestClient_FetchWAFMetrics(t *testing.T) {
 			t.Error("expected WAF events query body")
 		}
 		_, _ = w.Write([]byte(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","firewallEventsAdaptiveGroups":[
-			{"count":5,"dimensions":{"action":"block","source":"waf","ruleId":"abc123","clientCountryName":"US"}},
-			{"count":2,"dimensions":{"action":"challenge","source":"botManagement","ruleId":"","clientCountryName":"DE"}}
+			{"count":5,"avg":{"sampleInterval":1},"dimensions":{"action":"block","source":"waf","ruleId":"abc123","clientCountryName":"US"}},
+			{"count":2,"avg":{"sampleInterval":2.5},"dimensions":{"action":"challenge","source":"botManagement","ruleId":"","clientCountryName":"DE"}}
 		]}]}}}`))
 	})
 
@@ -131,6 +136,52 @@ func TestClient_FetchWAFMetrics(t *testing.T) {
 	}
 	if got[0].Count != 5 || got[0].Action != "block" || got[0].Source != "waf" || got[0].RuleID != "abc123" || got[0].Country != "US" {
 		t.Errorf("unexpected first group: %+v", got[0])
+	}
+	if got[1].Count != 5 {
+		t.Errorf("sampled group Count = %v, want 5 (2 records × sampleInterval 2.5)", got[1].Count)
+	}
+}
+
+func TestClient_FetchErrorMetrics(t *testing.T) {
+	c := newTestGraphQL(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(req.Query, "httpRequestsAdaptiveGroups") {
+			t.Error("expected error-metrics query body")
+		}
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","httpRequestsAdaptiveGroups":[
+			{"count":3,"avg":{"originResponseDurationMs":120,"sampleInterval":1},"dimensions":{"edgeResponseStatus":500,"originResponseStatus":500,"clientCountryName":"US","clientRequestHTTPHost":"example.com"}},
+			{"count":5,"avg":{"originResponseDurationMs":-1,"sampleInterval":10},"dimensions":{"edgeResponseStatus":403,"originResponseStatus":0,"clientCountryName":"FR","clientRequestHTTPHost":"example.com"}}
+		]}]}}}`))
+	})
+
+	got, err := c.FetchErrorMetrics(t.Context(), []string{"zone-1"}, time.Now().Add(-time.Minute), time.Now(), 100)
+	if err != nil {
+		t.Fatalf("FetchErrorMetrics() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d groups, want 2: %+v", len(got), got)
+	}
+	if got[0].Count != 3 || got[0].EdgeStatus != 500 || got[0].OriginStatus != 500 || got[0].Country != "US" || got[0].Host != "example.com" || got[0].AvgOriginDurationMs != 120 {
+		t.Errorf("unexpected first group: %+v", got[0])
+	}
+	if got[1].OriginStatus != 0 || got[1].AvgOriginDurationMs != -1 {
+		t.Errorf("unexpected second group (origin not contacted): %+v", got[1])
+	}
+	if got[1].Count != 50 {
+		t.Errorf("sampled group Count = %v, want 50 (5 records × sampleInterval 10)", got[1].Count)
+	}
+}
+
+func TestFetchErrorMetrics_NoZones(t *testing.T) {
+	c := newTestGraphQL(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("no request expected for empty zone list")
+	})
+	got, err := c.FetchErrorMetrics(t.Context(), nil, time.Now(), time.Now(), 1)
+	if err != nil || got != nil {
+		t.Fatalf("got %v, %v; want nil, nil", got, err)
 	}
 }
 

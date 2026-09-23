@@ -19,6 +19,9 @@ query DNSMetrics($accountTag: String!, $zoneIDs: [string!], $mintime: Time!, $ma
         filter: { zoneTag_in: $zoneIDs, datetime_geq: $mintime, datetime_lt: $maxtime }
       ) {
         count
+        avg {
+          sampleInterval
+        }
         dimensions {
           zoneTag
           queryType
@@ -33,7 +36,10 @@ type dnsMetricsResponse struct {
 	Viewer struct {
 		Accounts []struct {
 			DNSAnalyticsAdaptiveGroups []struct {
-				Count      float64 `json:"count"`
+				Count float64 `json:"count"`
+				Avg   struct {
+					SampleInterval float64 `json:"sampleInterval"`
+				} `json:"avg"`
 				Dimensions struct {
 					ZoneTag      string `json:"zoneTag"`
 					QueryType    string `json:"queryType"`
@@ -45,7 +51,8 @@ type dnsMetricsResponse struct {
 }
 
 // DNSQueryGroup is one (zone, query type, response code) bucket of DNS query
-// volume for the requested window.
+// volume for the requested window. Count is the sampling-corrected estimate
+// of real queries, not the raw sampled records.
 type DNSQueryGroup struct {
 	ZoneTag      string
 	QueryType    string
@@ -81,7 +88,7 @@ func (c *Client) FetchDNSMetrics(ctx context.Context, accountID string, zoneIDs 
 				ZoneTag:      g.Dimensions.ZoneTag,
 				QueryType:    g.Dimensions.QueryType,
 				ResponseCode: g.Dimensions.ResponseCode,
-				Count:        g.Count,
+				Count:        estimatedCount(g.Count, g.Avg.SampleInterval),
 			})
 		}
 	}

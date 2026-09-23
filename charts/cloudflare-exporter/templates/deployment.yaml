@@ -35,6 +35,7 @@ spec:
             - -analytics-window={{ .Values.exporter.analyticsWindow }}
             - -analytics-lag={{ .Values.exporter.analyticsLag }}
             - -query-limit={{ .Values.exporter.queryLimit }}
+            - -exclude-host={{ .Values.exporter.excludeHost }}
           ports:
             - name: metrics
               containerPort: {{ .Values.service.port }}

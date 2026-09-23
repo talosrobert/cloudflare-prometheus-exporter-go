@@ -27,6 +27,9 @@ query WAFMetrics($zoneIDs: [string!], $mintime: Time!, $maxtime: Time!, $limit: 
         filter: { datetime_geq: $mintime, datetime_lt: $maxtime }
       ) {
         count
+        avg {
+          sampleInterval
+        }
         dimensions {
           action
           source
@@ -43,7 +46,10 @@ type wafMetricsResponse struct {
 		Zones []struct {
 			ZoneTag                      string `json:"zoneTag"`
 			FirewallEventsAdaptiveGroups []struct {
-				Count      float64 `json:"count"`
+				Count float64 `json:"count"`
+				Avg   struct {
+					SampleInterval float64 `json:"sampleInterval"`
+				} `json:"avg"`
 				Dimensions struct {
 					Action            string `json:"action"`
 					Source            string `json:"source"`
@@ -56,7 +62,8 @@ type wafMetricsResponse struct {
 }
 
 // WAFEventGroup is one (zone, action, source, rule, country) bucket of
-// firewall/WAF event volume for the requested window.
+// firewall/WAF event volume for the requested window. Count is the
+// sampling-corrected estimate of real events, not the raw sampled records.
 type WAFEventGroup struct {
 	ZoneTag string
 	Action  string
@@ -95,7 +102,7 @@ func (c *Client) FetchWAFMetrics(ctx context.Context, zoneIDs []string, mintime,
 				Source:  g.Dimensions.Source,
 				RuleID:  g.Dimensions.RuleID,
 				Country: g.Dimensions.ClientCountryName,
-				Count:   g.Count,
+				Count:   estimatedCount(g.Count, g.Avg.SampleInterval),
 			})
 		}
 	}
