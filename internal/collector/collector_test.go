@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -151,6 +152,15 @@ func gather(t *testing.T, c *Collector) []*dto.MetricFamily {
 
 // hasSeries reports whether metric family name has a series carrying every
 // label in want.
+// findFamily returns the metric family with the given name, or nil if absent.
+func findFamily(families []*dto.MetricFamily, name string) *dto.MetricFamily {
+	i := slices.IndexFunc(families, func(mf *dto.MetricFamily) bool { return mf.GetName() == name })
+	if i < 0 {
+		return nil
+	}
+	return families[i]
+}
+
 func hasSeries(families []*dto.MetricFamily, name string, want map[string]string) bool {
 	for _, mf := range families {
 		if mf.GetName() != name {
@@ -337,14 +347,52 @@ func TestCollector_DisjointJobsSameAccountNoDuplicateSeries(t *testing.T) {
 			t.Errorf("expected %s to be scraped by its job", zone)
 		}
 	}
-	var truncatedSeries int
-	for _, mf := range out {
-		if mf.GetName() == "cloudflare_exporter_dns_result_truncated" {
-			truncatedSeries = len(mf.GetMetric())
-		}
-	}
+	truncatedSeries := len(findFamily(out, "cloudflare_exporter_dns_result_truncated").GetMetric())
 	if truncatedSeries != 1 {
 		t.Errorf("dns_result_truncated series = %d, want 1 per account", truncatedSeries)
+	}
+}
+
+// strayDNS behaves like fakeClient but every query also returns one row for a
+// zone that was never discovered, like Cloudflare does for workers.dev zones.
+type strayDNS struct{ *fakeClient }
+
+func (f *strayDNS) FetchDNSMetrics(ctx context.Context, accountID string, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.DNSQueryGroup, error) {
+	out, err := f.fakeClient.FetchDNSMetrics(ctx, accountID, zoneIDs, mintime, maxtime, limit)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, cloudflareapi.DNSQueryGroup{ZoneTag: "zone-workers-dev", QueryType: "A", ResponseCode: "NOERROR", Count: 99}), nil
+}
+
+// The account-scoped DNS gauges must reflect every job that queried the
+// account, not just the first one: a later job's truncated result must still
+// flag the account, and the same stray row seen by two jobs counts once.
+func TestCollector_DNSAccountGaugesMergeAcrossJobs(t *testing.T) {
+	fc := newFake()
+	fc.tags["acct1"]["zone-dev"] = map[string]string{"env": "dev"}
+	for _, qt := range []string{"A", "AAAA", "MX", "TXT"} {
+		fc.dnsGroups = append(fc.dnsGroups, cloudflareapi.DNSQueryGroup{ZoneTag: "zone-dev", QueryType: qt, ResponseCode: "NOERROR", Count: 1})
+	}
+	jobs := []config.DiscoveryJob{
+		{Name: "prod", SearchTags: []config.TagFilter{{Key: "env", Value: "production"}}},
+		{Name: "dev", SearchTags: []config.TagFilter{{Key: "env", Value: "dev"}}},
+	}
+	opts := testOptions()
+	// prod job sees 3 rows + 1 stray, dev job sees 4 rows + 1 stray: only the
+	// second job hits the limit.
+	opts.QueryLimit = 5
+	c := New(&strayDNS{fakeClient: fc}, jobs, opts, newTestLogger())
+
+	if err := testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP cloudflare_exporter_dns_result_truncated 1 if the account's DNS analytics result hit the query limit, meaning DNS metrics are undercounted
+# TYPE cloudflare_exporter_dns_result_truncated gauge
+cloudflare_exporter_dns_result_truncated{account_id="acct1"} 1
+# HELP cloudflare_exporter_dns_unmatched_groups DNS analytics rows skipped because their zone is not in scope; Cloudflare's zone list omits type=internal zones such as workers.dev
+# TYPE cloudflare_exporter_dns_unmatched_groups gauge
+cloudflare_exporter_dns_unmatched_groups{account_id="acct1"} 1
+`), "cloudflare_exporter_dns_result_truncated", "cloudflare_exporter_dns_unmatched_groups"); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -481,17 +529,12 @@ func TestCollector_WAFTruncationIsPerZone(t *testing.T) {
 	if !hasSeries(out, "cloudflare_zone_firewall_result_truncated", map[string]string{"zone": "prod.example.com"}) {
 		t.Fatal("expected a truncation series for zone-prod")
 	}
-	for _, mf := range out {
-		if mf.GetName() != "cloudflare_zone_firewall_result_truncated" {
-			continue
+	for _, m := range findFamily(out, "cloudflare_zone_firewall_result_truncated").GetMetric() {
+		if hasLabel(m, "zone", "prod.example.com") && m.GetGauge().GetValue() != 1 {
+			t.Errorf("zone-prod truncated = %v, want 1 (row count %d >= limit %d)", m.GetGauge().GetValue(), 2, opts.QueryLimit)
 		}
-		for _, m := range mf.GetMetric() {
-			if hasLabel(m, "zone", "prod.example.com") && m.GetGauge().GetValue() != 1 {
-				t.Errorf("zone-prod truncated = %v, want 1 (row count %d >= limit %d)", m.GetGauge().GetValue(), 2, opts.QueryLimit)
-			}
-			if hasLabel(m, "zone", "dev.example.com") && m.GetGauge().GetValue() != 0 {
-				t.Errorf("zone-dev truncated = %v, want 0 (no WAF rows at all)", m.GetGauge().GetValue())
-			}
+		if hasLabel(m, "zone", "dev.example.com") && m.GetGauge().GetValue() != 0 {
+			t.Errorf("zone-dev truncated = %v, want 0 (no WAF rows at all)", m.GetGauge().GetValue())
 		}
 	}
 }
