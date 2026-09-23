@@ -48,8 +48,8 @@ server:
 ```
 
 The Cloudflare API token is **not** read from this file — set it via the
-`CLOUDFLARE_API_TOKEN` environment variable (in Kubernetes, from a Secret; see
-[`k8s/secret.example.yaml`](k8s/secret.example.yaml)).
+`CLOUDFLARE_API_TOKEN` environment variable (in Kubernetes, from a Secret; see the
+[Helm chart's `apiToken`](charts/cloudflare-exporter/README.md#values) values).
 
 Command-line flags (all optional):
 
@@ -189,14 +189,18 @@ curl localhost:9199/metrics
 
 ## Running in Kubernetes
 
+Deploy with the Helm chart in [`charts/cloudflare-exporter`](charts/cloudflare-exporter/README.md):
+
 ```sh
-kubectl apply -f k8s/secret.example.yaml   # edit the token first
-kubectl apply -f k8s/configmap.yaml
-kubectl apply -f k8s/deployment.yaml
-kubectl apply -f k8s/service.yaml
-# optional, requires the Prometheus Operator CRDs:
-kubectl apply -f k8s/servicemonitor.example.yaml
+kubectl create secret generic cloudflare-exporter-token \
+  --from-literal=CLOUDFLARE_API_TOKEN=<your-token>
+
+helm install cloudflare-exporter charts/cloudflare-exporter \
+  --set apiToken.existingSecret=cloudflare-exporter-token
 ```
+
+See the chart's README for the full values reference (discovery jobs, `serviceMonitor`,
+resources, tolerations, ...).
 
 Build and push the image with the provided `Containerfile`:
 
@@ -205,7 +209,7 @@ podman build -t <your-registry>/cloudflare-prometheus-exporter-go:latest -f Cont
 podman push <your-registry>/cloudflare-prometheus-exporter-go:latest
 ```
 
-Then point `k8s/deployment.yaml`'s `image:` at your registry.
+Then point the chart's `image.repository`/`image.tag` values at your registry.
 
 ## Prometheus scrape config
 

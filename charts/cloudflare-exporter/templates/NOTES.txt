@@ -1,0 +1,16 @@
+cloudflare-exporter has been installed.
+
+{{- if and (not .Values.apiToken.existingSecret) (not .Values.apiToken.value) }}
+
+WARNING: neither apiToken.existingSecret nor apiToken.value is set. The Pod
+will start but every scrape will fail — CLOUDFLARE_API_TOKEN is empty.
+Create the token Secret yourself and pass its name as apiToken.existingSecret,
+or set apiToken.value for quick local testing:
+
+  kubectl create secret generic {{ include "cloudflare-exporter.fullname" . }}-token \
+    --namespace {{ .Release.Namespace }} \
+    --from-literal=CLOUDFLARE_API_TOKEN=<your-token>
+{{- end }}
+
+Metrics: kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "cloudflare-exporter.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+         curl localhost:{{ .Values.service.port }}{{ .Values.exporter.metricsPath }}

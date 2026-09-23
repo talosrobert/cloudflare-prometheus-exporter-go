@@ -1,0 +1,74 @@
+replicaCount: 1
+
+image:
+  repository: cloudflare-prometheus-exporter-go
+  # Defaults to Chart.AppVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# CLOUDFLARE_API_TOKEN source. Set exactly one:
+# - existingSecret: reference a Secret you created yourself (recommended).
+# - value: let the chart create the Secret for you from plaintext (only for
+#   quick local testing — never commit a values file with this set).
+apiToken:
+  existingSecret: ""
+  existingSecretKey: CLOUDFLARE_API_TOKEN
+  value: ""
+
+# Command-line flags, see the README's flags table.
+exporter:
+  configPath: /etc/cloudflare-exporter/config.yaml
+  analyticsWindow: 1m
+  analyticsLag: 5m
+  queryLimit: 10000
+  metricsPath: /metrics
+  scrapeTimeout: 30s
+  # Rendered as-is into config.yaml's discovery.jobs; see the main README for
+  # the searchTags/accounts shape.
+  discovery:
+    jobs:
+      - name: production-zones
+        searchTags:
+          - key: env
+            value: production
+
+service:
+  type: ClusterIP
+  port: 9199
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "9199"
+    prometheus.io/path: "/metrics"
+
+# Requires the Prometheus Operator CRDs.
+serviceMonitor:
+  enabled: false
+  interval: 60s
+  scrapeTimeout: 30s
+  labels: {}
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+podAnnotations: {}
+podLabels: {}

@@ -20,3 +20,12 @@ jobs:
           version: latest
       - run: go build ./...
       - run: go test ./... -race
+
+  chart:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint charts/cloudflare-exporter
+      - run: helm template test charts/cloudflare-exporter --set apiToken.existingSecret=dummy > /dev/null
+      - run: helm template test charts/cloudflare-exporter --set apiToken.value=dummy --set serviceMonitor.enabled=true > /dev/null

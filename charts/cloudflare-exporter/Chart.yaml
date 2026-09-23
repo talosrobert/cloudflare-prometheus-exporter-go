@@ -1,0 +1,16 @@
+apiVersion: v2
+name: cloudflare-exporter
+description: Prometheus exporter for Cloudflare zone analytics (HTTP, DNS, WAF), runs as a stateless Kubernetes Deployment.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/talosrobert/cloudflare-prometheus-exporter-go
+sources:
+  - https://github.com/talosrobert/cloudflare-prometheus-exporter-go
+keywords:
+  - cloudflare
+  - prometheus
+  - exporter
+  - monitoring
+maintainers:
+  - name: talosrobert
