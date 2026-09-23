@@ -76,6 +76,7 @@ type Collector struct {
 
 	scrapeErrors *prometheus.CounterVec
 	jobSuccess   *prometheus.GaugeVec
+	apiErrors    *prometheus.CounterVec
 
 	windowDesc   *prometheus.Desc
 	zoneInfoDesc *prometheus.Desc
@@ -106,6 +107,8 @@ type Collector struct {
 	dnsQueriesDesc             *prometheus.Desc
 	dnsQueriesTypeDesc         *prometheus.Desc
 	dnsQueriesResponseCodeDesc *prometheus.Desc
+	dnsTruncatedDesc           *prometheus.Desc
+	dnsUnmatchedDesc           *prometheus.Desc
 }
 
 // New builds a Collector for the given discovery jobs.
@@ -126,6 +129,11 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 			Name:      "exporter_job_success",
 			Help:      "1 if the discovery job's last scrape completed without error, 0 otherwise",
 		}, []string{"job"}),
+		apiErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "exporter_api_errors_total",
+			Help:      "Failed calls to an optional, separately permissioned Cloudflare API, by account; the remaining metrics are still exported",
+		}, []string{"account_id", "api"}),
 
 		windowDesc:   desc("exporter_analytics_window_seconds", "Length of the analytics window each zone metric is summed over", nil),
 		zoneInfoDesc: desc("zone_info", "Zone discovery info, value is always 1", withLabel(zoneLabels, "account_id", "account", "status")),
@@ -156,6 +164,8 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 		dnsQueriesDesc:             desc("zone_dns_queries", windowHelp("DNS queries"), zoneLabels),
 		dnsQueriesTypeDesc:         desc("zone_dns_queries_type", windowHelp("DNS queries by query type"), withLabel(zoneLabels, "query_type")),
 		dnsQueriesResponseCodeDesc: desc("zone_dns_queries_response_code", windowHelp("DNS queries by response code"), withLabel(zoneLabels, "response_code")),
+		dnsTruncatedDesc:           desc("exporter_dns_result_truncated", "1 if the account's DNS analytics result hit the query limit, meaning DNS metrics are undercounted", []string{"account_id"}),
+		dnsUnmatchedDesc:           desc("exporter_dns_unmatched_groups", "DNS analytics rows skipped because their zone is not in scope; Cloudflare's zone list omits type=internal zones such as workers.dev", []string{"account_id"}),
 	}
 }
 
@@ -163,6 +173,7 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	c.scrapeErrors.Describe(ch)
 	c.jobSuccess.Describe(ch)
+	c.apiErrors.Describe(ch)
 	for _, d := range c.allDescs() {
 		ch <- d
 	}
@@ -176,7 +187,7 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 		c.requestsSSLProtocolDesc, c.requestsHTTPVersionDesc, c.bandwidthDesc, c.bandwidthCachedDesc,
 		c.bandwidthSSLDesc, c.bandwidthContentTypeDesc, c.bandwidthCountryDesc, c.threatsDesc,
 		c.threatsCountryDesc, c.threatsTypeDesc, c.pageviewsDesc, c.uniquesDesc, c.cacheHitRatioDesc,
-		c.dnsQueriesDesc, c.dnsQueriesTypeDesc, c.dnsQueriesResponseCodeDesc,
+		c.dnsQueriesDesc, c.dnsQueriesTypeDesc, c.dnsQueriesResponseCodeDesc, c.dnsTruncatedDesc, c.dnsUnmatchedDesc,
 	}
 }
 
@@ -188,6 +199,10 @@ type scrape struct {
 	mintime, maxtime time.Time
 	zonesByAccount   map[string][]cloudflareapi.Zone
 	emitted          map[string]bool
+	// dnsFlagged guards the per-account DNS truncation gauge: two jobs can
+	// each select a different subset of the same account's zones, and emitting
+	// that account-scoped series twice would fail the whole scrape.
+	dnsFlagged map[string]bool
 }
 
 // Collect implements prometheus.Collector.
@@ -205,6 +220,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 		maxtime:        now.Add(-c.opts.Lag),
 		zonesByAccount: make(map[string][]cloudflareapi.Zone),
 		emitted:        make(map[string]bool),
+		dnsFlagged:     make(map[string]bool),
 	}
 
 	ch <- prometheus.MustNewConstMetric(c.windowDesc, prometheus.GaugeValue, c.opts.Window.Seconds())
@@ -221,6 +237,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	c.scrapeErrors.Collect(ch)
 	c.jobSuccess.Collect(ch)
+	c.apiErrors.Collect(ch)
 }
 
 func (c *Collector) collectJob(ctx context.Context, ch chan<- prometheus.Metric, s *scrape, job config.DiscoveryJob) error {
@@ -265,9 +282,20 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		s.zonesByAccount[accountID] = zones
 	}
 
+	// Resource Tagging needs its own token permission. When searchTags are
+	// configured the tags decide which zones to scrape, so a failure has to be
+	// fatal — guessing would either drop or over-report zones. With no filters
+	// the tags are only decoration for zone_tags_info, so keep going without
+	// them rather than losing every metric for the account.
 	tags, err := c.cf.ZoneTags(ctx, accountID, filters)
 	if err != nil {
-		return err
+		if len(filters) > 0 {
+			return err
+		}
+		c.logger.Warn("resource tags unavailable, continuing without tag labels",
+			"account_id", accountID, "error", err)
+		c.apiErrors.WithLabelValues(accountID, "resource_tagging").Inc()
+		tags = nil
 	}
 
 	// With search-tag filters configured, only zones the tag query matched are
@@ -316,49 +344,83 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		c.emitZoneMetrics(ch, zone, m)
 	}
 
+	// DNS analytics needs its own API token permission that Cloudflare does not
+	// clearly document, so a token good enough for everything else still gets
+	// "not authorized for that account" here. Treat it as non-fatal: record it
+	// and keep the metrics that did work.
 	dnsGroups, err := c.cf.FetchDNSMetrics(ctx, accountID, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
 	if err != nil {
-		return err
+		c.logger.Warn("dns analytics unavailable", "account_id", accountID, "error", err)
+		c.apiErrors.WithLabelValues(accountID, "dns_analytics").Inc()
+		return nil
 	}
-	c.emitDNSMetrics(ch, zoneByID, dnsGroups)
+	// Groups are one row per (zone, query type, response code); Cloudflare
+	// truncates silently at the limit, which would undercount every DNS metric
+	// below, so surface it instead of reporting wrong numbers quietly.
+	truncated := 0.0
+	if len(dnsGroups) > 0 && len(dnsGroups) >= c.opts.QueryLimit {
+		c.logger.Warn("dns analytics result hit query limit, metrics are undercounted",
+			"account_id", accountID, "query_limit", c.opts.QueryLimit)
+		truncated = 1
+	}
+	unmatched := c.emitDNSMetrics(ch, zoneByID, dnsGroups)
+	if unmatched.rows > 0 {
+		// Cloudflare's zone list omits type=internal zones (workers.dev and
+		// friends) while DNS analytics still reports their traffic, so those
+		// rows have no zone to attach to. Report it rather than dropping the
+		// data silently.
+		c.logger.Warn("dns analytics rows skipped, zone not in scope for this scrape",
+			"account_id", accountID, "rows", unmatched.rows, "example_zone_id", unmatched.exampleZone)
+	}
+	if !s.dnsFlagged[accountID] {
+		s.dnsFlagged[accountID] = true
+		ch <- prometheus.MustNewConstMetric(c.dnsTruncatedDesc, prometheus.GaugeValue, truncated, accountID)
+		ch <- prometheus.MustNewConstMetric(c.dnsUnmatchedDesc, prometheus.GaugeValue, float64(unmatched.rows), accountID)
+	}
 
 	return nil
 }
 
 type dnsZoneKey struct{ zoneID, label string }
 
-func (c *Collector) emitDNSMetrics(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, groups []cloudflareapi.DNSQueryGroup) {
+// unmatchedDNS counts DNS rows whose zone is not in scope for this scrape.
+type unmatchedDNS struct {
+	rows        int
+	exampleZone string
+}
+
+func (c *Collector) emitDNSMetrics(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, groups []cloudflareapi.DNSQueryGroup) unmatchedDNS {
 	totals := make(map[string]float64)
 	byType := make(map[dnsZoneKey]float64)
 	byResponseCode := make(map[dnsZoneKey]float64)
 
+	var unmatched unmatchedDNS
 	for _, g := range groups {
+		if _, inScope := zoneByID[g.ZoneTag]; !inScope {
+			unmatched.rows++
+			if unmatched.exampleZone == "" {
+				unmatched.exampleZone = g.ZoneTag
+			}
+			continue
+		}
 		totals[g.ZoneTag] += g.Count
 		byType[dnsZoneKey{g.ZoneTag, g.QueryType}] += g.Count
 		byResponseCode[dnsZoneKey{g.ZoneTag, g.ResponseCode}] += g.Count
 	}
 
 	for zoneID, total := range totals {
-		zone, ok := zoneByID[zoneID]
-		if !ok {
-			continue
-		}
+		zone := zoneByID[zoneID]
 		ch <- prometheus.MustNewConstMetric(c.dnsQueriesDesc, prometheus.GaugeValue, total, zone.ID, zone.Name)
 	}
 	for key, count := range byType {
-		zone, ok := zoneByID[key.zoneID]
-		if !ok {
-			continue
-		}
+		zone := zoneByID[key.zoneID]
 		ch <- prometheus.MustNewConstMetric(c.dnsQueriesTypeDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
 	}
 	for key, count := range byResponseCode {
-		zone, ok := zoneByID[key.zoneID]
-		if !ok {
-			continue
-		}
+		zone := zoneByID[key.zoneID]
 		ch <- prometheus.MustNewConstMetric(c.dnsQueriesResponseCodeDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
 	}
+	return unmatched
 }
 
 func (c *Collector) emitZoneMetrics(ch chan<- prometheus.Metric, zone cloudflareapi.Zone, m cloudflareapi.ZoneHTTPMetrics) {

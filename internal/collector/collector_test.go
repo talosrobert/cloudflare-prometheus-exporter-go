@@ -2,6 +2,7 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"strings"
@@ -250,6 +251,183 @@ cloudflare_zone_dns_queries_response_code{response_code="NXDOMAIN",zone="prod.ex
 	}
 }
 
+// A token lacking Cloudflare's (undocumented) DNS Analytics permission fails
+// only this dataset; every other metric must survive and the job must not be
+// marked failed.
+func TestCollector_DNSErrorIsNonFatal(t *testing.T) {
+	fc := &failingDNS{fakeClient: newFake()}
+	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+	if !hasSeries(out, "cloudflare_zone_requests", map[string]string{"zone": "prod.example.com"}) {
+		t.Error("HTTP metrics must survive a DNS failure")
+	}
+	if hasSeries(out, "cloudflare_zone_dns_queries", map[string]string{"zone": "prod.example.com"}) {
+		t.Error("no DNS metrics expected when the DNS query failed")
+	}
+	if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("all")); got != 1 {
+		t.Errorf("job_success = %v, want 1 (DNS failure is non-fatal)", got)
+	}
+	if got := testutil.ToFloat64(c.apiErrors.WithLabelValues("acct1", "dns_analytics")); got != 1 {
+		t.Errorf("api_errors_total{api=dns_analytics} = %v, want 1", got)
+	}
+}
+
+// Cloudflare truncates group results at the limit with no indication, which
+// would undercount DNS metrics, so the exporter must flag it.
+func TestCollector_DNSTruncationFlagged(t *testing.T) {
+	fc := newFake()
+	opts := testOptions()
+	opts.QueryLimit = len(fc.dnsGroups)
+	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+
+	if err := testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP cloudflare_exporter_dns_result_truncated 1 if the account's DNS analytics result hit the query limit, meaning DNS metrics are undercounted
+# TYPE cloudflare_exporter_dns_result_truncated gauge
+cloudflare_exporter_dns_result_truncated{account_id="acct1"} 1
+`), "cloudflare_exporter_dns_result_truncated"); err != nil {
+		t.Fatal(err)
+	}
+
+	opts.QueryLimit = len(fc.dnsGroups) + 1
+	c = New(newFake(), []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+	if err := testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP cloudflare_exporter_dns_result_truncated 1 if the account's DNS analytics result hit the query limit, meaning DNS metrics are undercounted
+# TYPE cloudflare_exporter_dns_result_truncated gauge
+cloudflare_exporter_dns_result_truncated{account_id="acct1"} 0
+`), "cloudflare_exporter_dns_result_truncated"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Two jobs can each select a different subset of the same account's zones, so
+// every account-scoped series must still be emitted exactly once per scrape.
+func TestCollector_DisjointJobsSameAccountNoDuplicateSeries(t *testing.T) {
+	fc := newFake()
+	fc.tags["acct1"]["zone-dev"] = map[string]string{"env": "dev"}
+	jobs := []config.DiscoveryJob{
+		{Name: "prod", SearchTags: []config.TagFilter{{Key: "env", Value: "production"}}},
+		{Name: "dev", SearchTags: []config.TagFilter{{Key: "env", Value: "dev"}}},
+	}
+	c := New(fc, jobs, testOptions(), newTestLogger())
+
+	// Pedantic Gather() rejects duplicate series, so a clean gather is the assertion.
+	out := gather(t, c)
+	for _, zone := range []string{"prod.example.com", "dev.example.com"} {
+		if !hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": zone}) {
+			t.Errorf("expected %s to be scraped by its job", zone)
+		}
+	}
+	var truncatedSeries int
+	for _, mf := range out {
+		if mf.GetName() == "cloudflare_exporter_dns_result_truncated" {
+			truncatedSeries = len(mf.GetMetric())
+		}
+	}
+	if truncatedSeries != 1 {
+		t.Errorf("dns_result_truncated series = %d, want 1 per account", truncatedSeries)
+	}
+}
+
+// Resource Tagging is separately permissioned. Without searchTags the tags are
+// only decoration, so a failure must not cost the account every other metric;
+// with searchTags they select the zones, so it must fail loudly instead.
+func TestCollector_TagErrorFatalOnlyWhenFiltering(t *testing.T) {
+	t.Run("no filters: non-fatal", func(t *testing.T) {
+		c := New(&failingTags{fakeClient: newFake()}, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+		out := gather(t, c)
+		if !hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": "prod.example.com"}) {
+			t.Error("zone discovery must survive a resource-tagging failure")
+		}
+		if !hasSeries(out, "cloudflare_zone_requests", map[string]string{"zone": "prod.example.com"}) {
+			t.Error("HTTP metrics must survive a resource-tagging failure")
+		}
+		if !hasSeries(out, "cloudflare_zone_dns_queries", map[string]string{"zone": "prod.example.com"}) {
+			t.Error("DNS metrics must survive a resource-tagging failure")
+		}
+		if hasSeries(out, "cloudflare_zone_tags_info", map[string]string{"zone": "prod.example.com"}) {
+			t.Error("no tag labels expected when the tag query failed")
+		}
+		if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("all")); got != 1 {
+			t.Errorf("job_success = %v, want 1", got)
+		}
+		if got := testutil.ToFloat64(c.apiErrors.WithLabelValues("acct1", "resource_tagging")); got != 1 {
+			t.Errorf("api_errors_total{api=resource_tagging} = %v, want 1", got)
+		}
+	})
+
+	t.Run("with filters: fatal", func(t *testing.T) {
+		job := config.DiscoveryJob{Name: "prod", SearchTags: []config.TagFilter{{Key: "env", Value: "production"}}}
+		c := New(&failingTags{fakeClient: newFake()}, []config.DiscoveryJob{job}, testOptions(), newTestLogger())
+
+		out := gather(t, c)
+		if hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": "prod.example.com"}) {
+			t.Error("must not scrape zones when the tag filter could not be evaluated")
+		}
+		if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("prod")); got != 0 {
+			t.Errorf("job_success = %v, want 0", got)
+		}
+	})
+}
+
+// An uninitialised Desc field panics prometheus.Registry on the first scrape,
+// so catch a forgotten initialiser here instead of in production.
+func TestCollector_AllDescsInitialised(t *testing.T) {
+	c := New(newFake(), []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+	for i, d := range c.allDescs() {
+		if d == nil {
+			t.Fatalf("allDescs()[%d] is nil — a Desc field is declared but never initialised in New", i)
+		}
+	}
+}
+
+// Cloudflare's zone list omits type=internal zones (workers.dev), yet DNS
+// analytics still reports their traffic, so those rows cannot be attributed to
+// a discovered zone. They must be counted, not dropped in silence.
+func TestCollector_DNSUnmatchedZonesCounted(t *testing.T) {
+	fc := newFake()
+	fc.dnsGroups = append(fc.dnsGroups, cloudflareapi.DNSQueryGroup{
+		ZoneTag: "zone-workers-dev", QueryType: "A", ResponseCode: "NOERROR", Count: 99,
+	})
+	// The fake filters by requested zone IDs, so return the stray row regardless.
+	c := New(&unscopedDNS{fakeClient: fc}, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	if err := testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP cloudflare_exporter_dns_unmatched_groups DNS analytics rows skipped because their zone is not in scope; Cloudflare's zone list omits type=internal zones such as workers.dev
+# TYPE cloudflare_exporter_dns_unmatched_groups gauge
+cloudflare_exporter_dns_unmatched_groups{account_id="acct1"} 1
+`), "cloudflare_exporter_dns_unmatched_groups"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The in-scope zone's totals must exclude the unmatched row's 99 queries.
+	c = New(&unscopedDNS{fakeClient: newFakeWithStray()}, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+	if err := testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP cloudflare_zone_dns_queries DNS queries in the analytics window (see cloudflare_exporter_analytics_window_seconds)
+# TYPE cloudflare_zone_dns_queries gauge
+cloudflare_zone_dns_queries{zone="prod.example.com",zone_id="zone-prod"} 15
+`), "cloudflare_zone_dns_queries"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newFakeWithStray() *fakeClient {
+	fc := newFake()
+	fc.dnsGroups = append(fc.dnsGroups, cloudflareapi.DNSQueryGroup{
+		ZoneTag: "zone-workers-dev", QueryType: "A", ResponseCode: "NOERROR", Count: 99,
+	})
+	return fc
+}
+
+// unscopedDNS mimics Cloudflare returning rows for zones that were not asked
+// for (and that zone discovery never surfaced).
+type unscopedDNS struct{ *fakeClient }
+
+func (f *unscopedDNS) FetchDNSMetrics(_ context.Context, _ string, _ []string, _, _ time.Time, _ int) ([]cloudflareapi.DNSQueryGroup, error) {
+	return f.dnsGroups, nil
+}
+
 func TestCollector_ScrapeErrorsAccumulate(t *testing.T) {
 	fc := newFake()
 	job := config.DiscoveryJob{Name: "broken", Accounts: []string{"missing"}}
@@ -266,6 +444,18 @@ func TestCollector_ScrapeErrorsAccumulate(t *testing.T) {
 	if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("broken")); got != 0 {
 		t.Errorf("job_success = %v, want 0", got)
 	}
+}
+
+type failingDNS struct{ *fakeClient }
+
+func (f *failingDNS) FetchDNSMetrics(_ context.Context, _ string, _ []string, _, _ time.Time, _ int) ([]cloudflareapi.DNSQueryGroup, error) {
+	return nil, errors.New("not authorized for that account")
+}
+
+type failingTags struct{ *fakeClient }
+
+func (f *failingTags) ZoneTags(_ context.Context, _ string, _ []cloudflareapi.TagFilter) (map[string]map[string]string, error) {
+	return nil, errors.New("403 Forbidden: Authentication error")
 }
 
 type failingZones struct{ *fakeClient }

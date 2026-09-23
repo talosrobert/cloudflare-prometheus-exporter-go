@@ -109,6 +109,31 @@ Exporter self-metrics:
 | `cloudflare_exporter_analytics_window_seconds` | | Configured `-analytics-window` |
 | `cloudflare_exporter_job_success` | `job` | 1 if the job's last scrape succeeded, else 0 |
 | `cloudflare_exporter_scrape_errors_total` | `job` | Cumulative failed scrapes per job |
+| `cloudflare_exporter_api_errors_total` | `account_id`, `api` | Failed calls to an optional, separately permissioned API (`dns_analytics`, `resource_tagging`); non-fatal |
+| `cloudflare_exporter_dns_result_truncated` | `account_id` | 1 if DNS results hit `-query-limit`, meaning DNS metrics are undercounted |
+| `cloudflare_exporter_dns_unmatched_groups` | `account_id` | DNS rows skipped because their zone was not in scope (see internal zones below) |
+
+### Partial-permission behaviour
+
+DNS Analytics and Resource Tagging each need their own token permission, and
+both are treated as optional so a narrow token still yields useful metrics:
+
+- **DNS Analytics unreadable** → `cloudflare_exporter_api_errors_total{api="dns_analytics"}`
+  increments; every other metric is exported normally.
+- **Resource Tagging unreadable** → if the job has no `searchTags`, tags are
+  only decoration, so `cloudflare_exporter_api_errors_total{api="resource_tagging"}`
+  increments and the scrape continues without `cloudflare_zone_tags_info`. If the
+  job *does* have `searchTags`, the tags decide which zones to scrape, so the
+  job fails loudly instead of silently scraping the wrong set of zones.
+
+### Internal zones (workers.dev)
+
+Cloudflare's zone list excludes `type=internal` zones — `*.workers.dev` among
+them — while DNS analytics still reports their query volume. Those rows have no
+discovered zone to attach to, so they are skipped and counted in
+`cloudflare_exporter_dns_unmatched_groups` rather than dropped silently. A
+non-zero value there means DNS traffic exists for zones this exporter does not
+scrape.
 
 Overlapping jobs (e.g. an "all zones" job plus a "prod only" job) are safe:
 each zone is emitted once per scrape, by the first job that selects it.
