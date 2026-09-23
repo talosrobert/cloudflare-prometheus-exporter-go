@@ -44,12 +44,14 @@ type DiscoveryJob struct {
 	SearchTags []TagFilter `yaml:"searchTags,omitempty"`
 }
 
+// ServerConfig controls the exporter's own HTTP listener.
 type ServerConfig struct {
 	ListenAddress string        `yaml:"listenAddress"`
 	MetricsPath   string        `yaml:"metricsPath"`
 	ScrapeTimeout time.Duration `yaml:"scrapeTimeout"`
 }
 
+// Config is the fully loaded exporter configuration.
 type Config struct {
 	Discovery struct {
 		Jobs []DiscoveryJob `yaml:"jobs"`
@@ -62,7 +64,7 @@ type Config struct {
 	APIToken string `yaml:"-"`
 }
 
-const apiTokenEnvVar = "CLOUDFLARE_API_TOKEN"
+const apiTokenEnvVar = "CLOUDFLARE_API_TOKEN" //nolint:gosec // variable name, not a credential
 
 func defaults() Config {
 	var c Config
@@ -76,7 +78,7 @@ func defaults() Config {
 func Load(path string) (*Config, error) {
 	cfg := defaults()
 
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path is the operator-supplied -config flag
 	if err != nil {
 		return nil, fmt.Errorf("reading config file %q: %w", path, err)
 	}
@@ -87,6 +89,9 @@ func Load(path string) (*Config, error) {
 	cfg.APIToken = os.Getenv(apiTokenEnvVar)
 	if cfg.APIToken == "" {
 		return nil, fmt.Errorf("%s environment variable is required", apiTokenEnvVar)
+	}
+	if cfg.Server.ScrapeTimeout <= 0 {
+		return nil, fmt.Errorf("server.scrapeTimeout must be positive, got %s", cfg.Server.ScrapeTimeout)
 	}
 	if len(cfg.Discovery.Jobs) == 0 {
 		return nil, fmt.Errorf("config must define at least one discovery.jobs entry")

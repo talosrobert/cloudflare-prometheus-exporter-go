@@ -15,11 +15,6 @@ import (
 	"github.com/talosrobert/cloudflare-prometheus-exporter-go/internal/config"
 )
 
-// formatStatus renders an HTTP status code as its metric label value.
-func formatStatus(code int) string {
-	return strconv.Itoa(code)
-}
-
 const namespace = "cloudflare"
 
 // zoneLabels is the base label set every zone-scoped metric carries.
@@ -36,6 +31,12 @@ func desc(name, help string, labels []string) *prometheus.Desc {
 	return prometheus.NewDesc(namespace+"_"+name, help, labels, nil)
 }
 
+// windowHelp phrases help text for metrics that are sums over the analytics
+// window of a single scrape, not cumulative totals.
+func windowHelp(what string) string {
+	return what + " in the analytics window (see cloudflare_exporter_analytics_window_seconds)"
+}
+
 // cloudflareClient is the subset of *cloudflareapi.Client the collector
 // needs, so tests can supply a fake instead of hitting the real API.
 type cloudflareClient interface {
@@ -45,23 +46,41 @@ type cloudflareClient interface {
 	FetchHTTPMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.ZoneHTTPMetrics, error)
 }
 
+// Options tune how a Collector queries Cloudflare.
+type Options struct {
+	// Window is the trailing time range of analytics pulled per scrape.
+	Window time.Duration
+	// Lag shifts the window into the past to allow for Cloudflare's analytics
+	// ingestion delay; querying up to "now" routinely returns empty data.
+	Lag time.Duration
+	// QueryLimit caps GraphQL result rows requested per zone.
+	QueryLimit int
+	// ScrapeTimeout bounds one whole Collect call across all jobs.
+	ScrapeTimeout time.Duration
+}
+
 // Collector orchestrates discovery jobs and turns their results into
 // Prometheus metrics. It queries Cloudflare on every scrape (no background
 // cache), matching how a stateless Kubernetes pod behind promhttp is expected
-// to behave; ScrapeTimeout in the server config should be set generously
-// enough for the account/zone counts involved.
+// to behave.
+//
+// Every analytics metric is a gauge holding the sum over Options.Window for
+// that scrape: Cloudflare's GraphQL API returns per-window aggregates, not
+// running totals, so exposing them as counters would break rate()/increase().
 type Collector struct {
-	cf         cloudflareClient
-	jobs       []config.DiscoveryJob
-	queryLimit int
-	window     time.Duration
-	logger     *slog.Logger
+	cf     cloudflareClient
+	jobs   []config.DiscoveryJob
+	opts   Options
+	logger *slog.Logger
 
-	zoneInfoDesc  *prometheus.Desc
-	tagInfoDesc   *prometheus.Desc
-	scrapeErrDesc *prometheus.Desc
+	scrapeErrors *prometheus.CounterVec
+	jobSuccess   *prometheus.GaugeVec
 
-	requestsTotalDesc        *prometheus.Desc
+	windowDesc   *prometheus.Desc
+	zoneInfoDesc *prometheus.Desc
+	tagInfoDesc  *prometheus.Desc
+
+	requestsDesc             *prometheus.Desc
 	requestsCachedDesc       *prometheus.Desc
 	requestsSSLDesc          *prometheus.Desc
 	requestsContentTypeDesc  *prometheus.Desc
@@ -71,60 +90,70 @@ type Collector struct {
 	requestsIPClassDesc      *prometheus.Desc
 	requestsSSLProtocolDesc  *prometheus.Desc
 	requestsHTTPVersionDesc  *prometheus.Desc
-	bandwidthTotalDesc       *prometheus.Desc
+	bandwidthDesc            *prometheus.Desc
 	bandwidthCachedDesc      *prometheus.Desc
 	bandwidthSSLDesc         *prometheus.Desc
 	bandwidthContentTypeDesc *prometheus.Desc
 	bandwidthCountryDesc     *prometheus.Desc
-	threatsTotalDesc         *prometheus.Desc
+	threatsDesc              *prometheus.Desc
 	threatsCountryDesc       *prometheus.Desc
 	threatsTypeDesc          *prometheus.Desc
-	pageviewsTotalDesc       *prometheus.Desc
-	uniquesTotalDesc         *prometheus.Desc
+	pageviewsDesc            *prometheus.Desc
+	uniquesDesc              *prometheus.Desc
 	cacheHitRatioDesc        *prometheus.Desc
 }
 
-// New builds a Collector. window is the trailing time range analytics are
-// pulled for on each scrape (e.g. one minute matches the underlying
-// httpRequests1mGroups granularity); queryLimit caps GraphQL result rows per
-// zone, mirroring the original exporter's QUERY_LIMIT.
-func New(cf cloudflareClient, jobs []config.DiscoveryJob, window time.Duration, queryLimit int, logger *slog.Logger) *Collector {
+// New builds a Collector for the given discovery jobs.
+func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *slog.Logger) *Collector {
 	return &Collector{
-		cf:         cf,
-		jobs:       jobs,
-		queryLimit: queryLimit,
-		window:     window,
-		logger:     logger,
+		cf:     cf,
+		jobs:   jobs,
+		opts:   opts,
+		logger: logger,
 
-		zoneInfoDesc:  desc("zone_info", "Zone discovery info, value is always 1", withLabel(zoneLabels, "account_id", "account", "status")),
-		tagInfoDesc:   desc("zone_tags_info", "Cloudflare resource tags attached to the zone, value is always 1", withLabel(zoneLabels, "tag_key", "tag_value")),
-		scrapeErrDesc: desc("exporter_scrape_errors_total", "Errors encountered while scraping the Cloudflare API, by discovery job", []string{"job"}),
+		scrapeErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: namespace,
+			Name:      "exporter_scrape_errors_total",
+			Help:      "Errors encountered while scraping the Cloudflare API, by discovery job",
+		}, []string{"job"}),
+		jobSuccess: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "exporter_job_success",
+			Help:      "1 if the discovery job's last scrape completed without error, 0 otherwise",
+		}, []string{"job"}),
 
-		requestsTotalDesc:        desc("zone_requests_total", "Total requests", zoneLabels),
-		requestsCachedDesc:       desc("zone_requests_cached", "Cached requests", zoneLabels),
-		requestsSSLDesc:          desc("zone_requests_ssl_encrypted_total", "SSL encrypted requests", zoneLabels),
-		requestsContentTypeDesc:  desc("zone_requests_content_type_total", "Requests by content type", withLabel(zoneLabels, "content_type")),
-		requestsCountryDesc:      desc("zone_requests_country_total", "Requests by country", withLabel(zoneLabels, "country")),
-		requestsStatusDesc:       desc("zone_requests_status_total", "Requests by status code", withLabel(zoneLabels, "status")),
-		requestsBrowserDesc:      desc("zone_requests_browser_map_page_views_total", "Page views by browser family", withLabel(zoneLabels, "family")),
-		requestsIPClassDesc:      desc("zone_requests_ip_class_total", "Requests by IP classification", withLabel(zoneLabels, "ip_type")),
-		requestsSSLProtocolDesc:  desc("zone_requests_ssl_protocol_total", "Requests by SSL/TLS protocol version", withLabel(zoneLabels, "ssl_protocol")),
-		requestsHTTPVersionDesc:  desc("zone_requests_http_version_total", "Requests by HTTP protocol version", withLabel(zoneLabels, "http_version")),
-		bandwidthTotalDesc:       desc("zone_bandwidth_total", "Total bandwidth bytes", zoneLabels),
-		bandwidthCachedDesc:      desc("zone_bandwidth_cached_total", "Cached bandwidth bytes", zoneLabels),
-		bandwidthSSLDesc:         desc("zone_bandwidth_ssl_encrypted_total", "SSL encrypted bandwidth bytes", zoneLabels),
-		bandwidthContentTypeDesc: desc("zone_bandwidth_content_type_total", "Bandwidth by content type", withLabel(zoneLabels, "content_type")),
-		bandwidthCountryDesc:     desc("zone_bandwidth_country_total", "Bandwidth by country", withLabel(zoneLabels, "country")),
-		threatsTotalDesc:         desc("zone_threats_total", "Total threats", zoneLabels),
-		threatsCountryDesc:       desc("zone_threats_country_total", "Threats by country", withLabel(zoneLabels, "country")),
-		threatsTypeDesc:          desc("zone_threats_type_total", "Threats by type", withLabel(zoneLabels, "type")),
-		pageviewsTotalDesc:       desc("zone_pageviews_total", "Total pageviews", zoneLabels),
-		uniquesTotalDesc:         desc("zone_uniques_total", "Unique visitors", zoneLabels),
-		cacheHitRatioDesc:        desc("zone_cache_hit_ratio", "Cache hit ratio", zoneLabels),
+		windowDesc:   desc("exporter_analytics_window_seconds", "Length of the analytics window each zone metric is summed over", nil),
+		zoneInfoDesc: desc("zone_info", "Zone discovery info, value is always 1", withLabel(zoneLabels, "account_id", "account", "status")),
+		tagInfoDesc:  desc("zone_tags_info", "Cloudflare resource tags attached to the zone, value is always 1", withLabel(zoneLabels, "tag_key", "tag_value")),
+
+		requestsDesc:             desc("zone_requests", windowHelp("Requests"), zoneLabels),
+		requestsCachedDesc:       desc("zone_requests_cached", windowHelp("Cached requests"), zoneLabels),
+		requestsSSLDesc:          desc("zone_requests_ssl_encrypted", windowHelp("SSL encrypted requests"), zoneLabels),
+		requestsContentTypeDesc:  desc("zone_requests_content_type", windowHelp("Requests by content type"), withLabel(zoneLabels, "content_type")),
+		requestsCountryDesc:      desc("zone_requests_country", windowHelp("Requests by country"), withLabel(zoneLabels, "country")),
+		requestsStatusDesc:       desc("zone_requests_status", windowHelp("Requests by status code"), withLabel(zoneLabels, "status")),
+		requestsBrowserDesc:      desc("zone_requests_browser_map_page_views", windowHelp("Page views by browser family"), withLabel(zoneLabels, "family")),
+		requestsIPClassDesc:      desc("zone_requests_ip_class", windowHelp("Requests by IP classification"), withLabel(zoneLabels, "ip_type")),
+		requestsSSLProtocolDesc:  desc("zone_requests_ssl_protocol", windowHelp("Requests by SSL/TLS protocol version"), withLabel(zoneLabels, "ssl_protocol")),
+		requestsHTTPVersionDesc:  desc("zone_requests_http_version", windowHelp("Requests by HTTP protocol version"), withLabel(zoneLabels, "http_version")),
+		bandwidthDesc:            desc("zone_bandwidth_bytes", windowHelp("Bandwidth"), zoneLabels),
+		bandwidthCachedDesc:      desc("zone_bandwidth_cached_bytes", windowHelp("Cached bandwidth"), zoneLabels),
+		bandwidthSSLDesc:         desc("zone_bandwidth_ssl_encrypted_bytes", windowHelp("SSL encrypted bandwidth"), zoneLabels),
+		bandwidthContentTypeDesc: desc("zone_bandwidth_content_type_bytes", windowHelp("Bandwidth by content type"), withLabel(zoneLabels, "content_type")),
+		bandwidthCountryDesc:     desc("zone_bandwidth_country_bytes", windowHelp("Bandwidth by country"), withLabel(zoneLabels, "country")),
+		threatsDesc:              desc("zone_threats", windowHelp("Threats"), zoneLabels),
+		threatsCountryDesc:       desc("zone_threats_country", windowHelp("Threats by country"), withLabel(zoneLabels, "country")),
+		threatsTypeDesc:          desc("zone_threats_type", windowHelp("Threats by type"), withLabel(zoneLabels, "type")),
+		pageviewsDesc:            desc("zone_pageviews", windowHelp("Page views"), zoneLabels),
+		uniquesDesc:              desc("zone_uniques", windowHelp("Unique visitors"), zoneLabels),
+		cacheHitRatioDesc:        desc("zone_cache_hit_ratio", windowHelp("Cache hit ratio (cached requests / requests)"), zoneLabels),
 	}
 }
 
+// Describe implements prometheus.Collector.
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
+	c.scrapeErrors.Describe(ch)
+	c.jobSuccess.Describe(ch)
 	for _, d := range c.allDescs() {
 		ch <- d
 	}
@@ -132,34 +161,66 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 
 func (c *Collector) allDescs() []*prometheus.Desc {
 	return []*prometheus.Desc{
-		c.zoneInfoDesc, c.tagInfoDesc, c.scrapeErrDesc,
-		c.requestsTotalDesc, c.requestsCachedDesc, c.requestsSSLDesc, c.requestsContentTypeDesc,
+		c.windowDesc, c.zoneInfoDesc, c.tagInfoDesc,
+		c.requestsDesc, c.requestsCachedDesc, c.requestsSSLDesc, c.requestsContentTypeDesc,
 		c.requestsCountryDesc, c.requestsStatusDesc, c.requestsBrowserDesc, c.requestsIPClassDesc,
-		c.requestsSSLProtocolDesc, c.requestsHTTPVersionDesc, c.bandwidthTotalDesc, c.bandwidthCachedDesc,
-		c.bandwidthSSLDesc, c.bandwidthContentTypeDesc, c.bandwidthCountryDesc, c.threatsTotalDesc,
-		c.threatsCountryDesc, c.threatsTypeDesc, c.pageviewsTotalDesc, c.uniquesTotalDesc, c.cacheHitRatioDesc,
+		c.requestsSSLProtocolDesc, c.requestsHTTPVersionDesc, c.bandwidthDesc, c.bandwidthCachedDesc,
+		c.bandwidthSSLDesc, c.bandwidthContentTypeDesc, c.bandwidthCountryDesc, c.threatsDesc,
+		c.threatsCountryDesc, c.threatsTypeDesc, c.pageviewsDesc, c.uniquesDesc, c.cacheHitRatioDesc,
 	}
 }
 
+// scrape holds per-Collect state: the time window, memoised per-account API
+// results, and the set of zones already emitted so that overlapping jobs
+// (e.g. "all zones" plus "prod only") never produce duplicate series, which
+// would make the registry reject the entire scrape.
+type scrape struct {
+	mintime, maxtime time.Time
+	zonesByAccount   map[string][]cloudflareapi.Zone
+	emitted          map[string]bool
+}
+
+// Collect implements prometheus.Collector.
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ctx := context.Background()
+	if c.opts.ScrapeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, c.opts.ScrapeTimeout)
+		defer cancel()
+	}
+
 	now := time.Now()
+	s := &scrape{
+		mintime:        now.Add(-c.opts.Lag - c.opts.Window),
+		maxtime:        now.Add(-c.opts.Lag),
+		zonesByAccount: make(map[string][]cloudflareapi.Zone),
+		emitted:        make(map[string]bool),
+	}
+
+	ch <- prometheus.MustNewConstMetric(c.windowDesc, prometheus.GaugeValue, c.opts.Window.Seconds())
 
 	for _, job := range c.jobs {
-		if err := c.collectJob(ctx, ch, job, now); err != nil {
+		if err := c.collectJob(ctx, ch, s, job); err != nil {
 			c.logger.Error("discovery job failed", "job", job.Name, "error", err)
-			ch <- prometheus.MustNewConstMetric(c.scrapeErrDesc, prometheus.CounterValue, 1, job.Name)
+			c.scrapeErrors.WithLabelValues(job.Name).Inc()
+			c.jobSuccess.WithLabelValues(job.Name).Set(0)
+			continue
 		}
+		c.jobSuccess.WithLabelValues(job.Name).Set(1)
 	}
+
+	c.scrapeErrors.Collect(ch)
+	c.jobSuccess.Collect(ch)
 }
 
-func (c *Collector) collectJob(ctx context.Context, ch chan<- prometheus.Metric, job config.DiscoveryJob, now time.Time) error {
+func (c *Collector) collectJob(ctx context.Context, ch chan<- prometheus.Metric, s *scrape, job config.DiscoveryJob) error {
 	accountIDs := job.Accounts
 	if len(accountIDs) == 0 {
 		accounts, err := c.cf.ListAccounts(ctx)
 		if err != nil {
 			return err
 		}
+		accountIDs = make([]string, 0, len(accounts))
 		for _, a := range accounts {
 			accountIDs = append(accountIDs, a.ID)
 		}
@@ -170,18 +231,28 @@ func (c *Collector) collectJob(ctx context.Context, ch chan<- prometheus.Metric,
 		filters = append(filters, cloudflareapi.TagFilter{Key: f.Key, Value: f.Value, Negate: f.Negate})
 	}
 
+	seen := make(map[string]bool, len(accountIDs))
 	for _, accountID := range accountIDs {
-		if err := c.collectAccount(ctx, ch, accountID, filters, now); err != nil {
+		if seen[accountID] {
+			continue
+		}
+		seen[accountID] = true
+		if err := c.collectAccount(ctx, ch, s, accountID, filters); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Metric, accountID string, filters []cloudflareapi.TagFilter, now time.Time) error {
-	zones, err := c.cf.ListZones(ctx, accountID)
-	if err != nil {
-		return err
+func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Metric, s *scrape, accountID string, filters []cloudflareapi.TagFilter) error {
+	zones, ok := s.zonesByAccount[accountID]
+	if !ok {
+		var err error
+		zones, err = c.cf.ListZones(ctx, accountID)
+		if err != nil {
+			return err
+		}
+		s.zonesByAccount[accountID] = zones
 	}
 
 	tags, err := c.cf.ZoneTags(ctx, accountID, filters)
@@ -191,25 +262,28 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 
 	// With search-tag filters configured, only zones the tag query matched are
 	// in scope; with none configured every zone in the account is in scope
-	// (tags map may still be sparse — not every zone need be tagged).
-	filtered := zones
-	if len(filters) > 0 {
-		filtered = filtered[:0]
-		for _, z := range zones {
-			if _, ok := tags[z.ID]; ok {
-				filtered = append(filtered, z)
-			}
+	// (tags map may still be sparse — not every zone need be tagged). Zones
+	// already emitted by an earlier job in this scrape are skipped.
+	var selected []cloudflareapi.Zone
+	for _, z := range zones {
+		if s.emitted[z.ID] {
+			continue
 		}
+		if _, tagged := tags[z.ID]; len(filters) > 0 && !tagged {
+			continue
+		}
+		selected = append(selected, z)
 	}
-	if len(filtered) == 0 {
+	if len(selected) == 0 {
 		return nil
 	}
 
-	zoneIDs := make([]string, len(filtered))
-	zoneByID := make(map[string]cloudflareapi.Zone, len(filtered))
-	for i, z := range filtered {
+	zoneIDs := make([]string, len(selected))
+	zoneByID := make(map[string]cloudflareapi.Zone, len(selected))
+	for i, z := range selected {
 		zoneIDs[i] = z.ID
 		zoneByID[z.ID] = z
+		s.emitted[z.ID] = true
 
 		ch <- prometheus.MustNewConstMetric(c.zoneInfoDesc, prometheus.GaugeValue, 1, z.ID, z.Name, z.Account.ID, z.Account.Name, z.Status)
 		for k, v := range tags[z.ID] {
@@ -217,7 +291,7 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		}
 	}
 
-	metrics, err := c.cf.FetchHTTPMetrics(ctx, zoneIDs, now.Add(-c.window), now, c.queryLimit)
+	metrics, err := c.cf.FetchHTTPMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
 	if err != nil {
 		return err
 	}
@@ -238,72 +312,68 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 func (c *Collector) emitZoneMetrics(ch chan<- prometheus.Metric, zone cloudflareapi.Zone, m cloudflareapi.ZoneHTTPMetrics) {
 	labels := []string{zone.ID, zone.Name}
 	sum := m.Group.Sum
+	gauge := func(d *prometheus.Desc, v float64, extra ...string) {
+		ch <- prometheus.MustNewConstMetric(d, prometheus.GaugeValue, v, withLabel(labels, extra...)...)
+	}
 
-	ch <- prometheus.MustNewConstMetric(c.requestsTotalDesc, prometheus.CounterValue, sum.Requests, labels...)
-	ch <- prometheus.MustNewConstMetric(c.requestsCachedDesc, prometheus.GaugeValue, sum.CachedRequests, labels...)
-	ch <- prometheus.MustNewConstMetric(c.requestsSSLDesc, prometheus.CounterValue, sum.EncryptedRequests, labels...)
-	ch <- prometheus.MustNewConstMetric(c.bandwidthTotalDesc, prometheus.CounterValue, sum.Bytes, labels...)
-	ch <- prometheus.MustNewConstMetric(c.bandwidthCachedDesc, prometheus.CounterValue, sum.CachedBytes, labels...)
-	ch <- prometheus.MustNewConstMetric(c.bandwidthSSLDesc, prometheus.CounterValue, sum.EncryptedBytes, labels...)
-	ch <- prometheus.MustNewConstMetric(c.threatsTotalDesc, prometheus.CounterValue, sum.Threats, labels...)
-	ch <- prometheus.MustNewConstMetric(c.pageviewsTotalDesc, prometheus.CounterValue, sum.PageViews, labels...)
-	ch <- prometheus.MustNewConstMetric(c.uniquesTotalDesc, prometheus.CounterValue, m.Group.Uniq.Uniques, labels...)
+	gauge(c.requestsDesc, sum.Requests)
+	gauge(c.requestsCachedDesc, sum.CachedRequests)
+	gauge(c.requestsSSLDesc, sum.EncryptedRequests)
+	gauge(c.bandwidthDesc, sum.Bytes)
+	gauge(c.bandwidthCachedDesc, sum.CachedBytes)
+	gauge(c.bandwidthSSLDesc, sum.EncryptedBytes)
+	gauge(c.threatsDesc, sum.Threats)
+	gauge(c.pageviewsDesc, sum.PageViews)
+	gauge(c.uniquesDesc, m.Group.Uniq.Uniques)
 
 	if sum.Requests > 0 {
-		ch <- prometheus.MustNewConstMetric(c.cacheHitRatioDesc, prometheus.GaugeValue, sum.CachedRequests/sum.Requests, labels...)
+		gauge(c.cacheHitRatioDesc, sum.CachedRequests/sum.Requests)
 	}
 
 	for _, ct := range sum.ContentTypeMap {
-		l := withLabel(labels, ct.EdgeResponseContentTypeName)
-		ch <- prometheus.MustNewConstMetric(c.requestsContentTypeDesc, prometheus.CounterValue, ct.Requests, l...)
-		ch <- prometheus.MustNewConstMetric(c.bandwidthContentTypeDesc, prometheus.CounterValue, ct.Bytes, l...)
+		gauge(c.requestsContentTypeDesc, ct.Requests, ct.EdgeResponseContentTypeName)
+		gauge(c.bandwidthContentTypeDesc, ct.Bytes, ct.EdgeResponseContentTypeName)
 	}
 
 	for _, cn := range sum.CountryMap {
-		l := withLabel(labels, cn.ClientCountryName)
-		ch <- prometheus.MustNewConstMetric(c.requestsCountryDesc, prometheus.CounterValue, cn.Requests, l...)
-		ch <- prometheus.MustNewConstMetric(c.bandwidthCountryDesc, prometheus.CounterValue, cn.Bytes, l...)
+		gauge(c.requestsCountryDesc, cn.Requests, cn.ClientCountryName)
+		gauge(c.bandwidthCountryDesc, cn.Bytes, cn.ClientCountryName)
 		if cn.Threats > 0 {
-			ch <- prometheus.MustNewConstMetric(c.threatsCountryDesc, prometheus.CounterValue, cn.Threats, l...)
+			gauge(c.threatsCountryDesc, cn.Threats, cn.ClientCountryName)
 		}
 	}
 
 	statusTotals := make(map[string]float64)
-	for _, s := range sum.ResponseStatusMap {
-		key := formatStatus(s.EdgeResponseStatus)
-		statusTotals[key] += s.Requests
+	for _, st := range sum.ResponseStatusMap {
+		statusTotals[strconv.Itoa(st.EdgeResponseStatus)] += st.Requests
 	}
 	for status, count := range statusTotals {
-		ch <- prometheus.MustNewConstMetric(c.requestsStatusDesc, prometheus.CounterValue, count, withLabel(labels, status)...)
+		gauge(c.requestsStatusDesc, count, status)
 	}
 
 	for _, b := range sum.BrowserMap {
 		if b.PageViews > 0 {
-			ch <- prometheus.MustNewConstMetric(c.requestsBrowserDesc, prometheus.CounterValue, b.PageViews, withLabel(labels, b.UaBrowserFamily)...)
+			gauge(c.requestsBrowserDesc, b.PageViews, b.UaBrowserFamily)
 		}
 	}
-
 	for _, t := range sum.ThreatPathingMap {
 		if t.Requests > 0 {
-			ch <- prometheus.MustNewConstMetric(c.threatsTypeDesc, prometheus.CounterValue, t.Requests, withLabel(labels, t.ThreatPathingName)...)
+			gauge(c.threatsTypeDesc, t.Requests, t.ThreatPathingName)
 		}
 	}
-
 	for _, ip := range sum.IPClassMap {
 		if ip.Requests > 0 {
-			ch <- prometheus.MustNewConstMetric(c.requestsIPClassDesc, prometheus.CounterValue, ip.Requests, withLabel(labels, ip.IPType)...)
+			gauge(c.requestsIPClassDesc, ip.Requests, ip.IPType)
 		}
 	}
-
 	for _, ssl := range sum.ClientSSLMap {
 		if ssl.Requests > 0 {
-			ch <- prometheus.MustNewConstMetric(c.requestsSSLProtocolDesc, prometheus.CounterValue, ssl.Requests, withLabel(labels, ssl.ClientSSLProtocol)...)
+			gauge(c.requestsSSLProtocolDesc, ssl.Requests, ssl.ClientSSLProtocol)
 		}
 	}
-
 	for _, hv := range sum.ClientHTTPVersionMap {
 		if hv.Requests > 0 {
-			ch <- prometheus.MustNewConstMetric(c.requestsHTTPVersionDesc, prometheus.CounterValue, hv.Requests, withLabel(labels, hv.ClientHTTPProtocol)...)
+			gauge(c.requestsHTTPVersionDesc, hv.Requests, hv.ClientHTTPProtocol)
 		}
 	}
 }

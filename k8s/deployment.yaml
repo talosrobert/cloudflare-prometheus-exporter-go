@@ -20,7 +20,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: cloudflare-exporter
-          image: cloudflare-prometheus-exporter-go:latest
+          # Pin to a released tag or digest before deploying.
+          image: cloudflare-prometheus-exporter-go:v0.1.0
+          imagePullPolicy: IfNotPresent
           args:
             - -config=/etc/cloudflare-exporter/config.yaml
           ports:

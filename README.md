@@ -56,8 +56,59 @@ Command-line flags (all optional):
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-config` | `/etc/cloudflare-exporter/config.yaml` | Path to the YAML config file |
-| `-analytics-window` | `1m` | Trailing time range of HTTP analytics pulled per scrape |
+| `-analytics-window` | `1m` | Time range each analytics metric is summed over per scrape |
+| `-analytics-lag` | `5m` | How far behind "now" the window ends, allowing for Cloudflare's ingestion delay |
 | `-query-limit` | `10000` | Max GraphQL result rows requested per zone |
+
+## Metrics
+
+All `cloudflare_zone_*` analytics metrics are **gauges holding the sum over
+the analytics window** for that scrape (Cloudflare's GraphQL API returns
+per-window aggregates, not running totals, so they cannot be counters). To
+get a per-second rate, divide by `cloudflare_exporter_analytics_window_seconds`:
+
+```promql
+cloudflare_zone_requests / on() group_left cloudflare_exporter_analytics_window_seconds
+```
+
+Labels on every zone metric: `zone_id`, `zone`.
+
+| Metric | Extra labels | Description |
+|--------|--------------|-------------|
+| `cloudflare_zone_info` | `account_id`, `account`, `status` | Discovered zone, always 1 |
+| `cloudflare_zone_tags_info` | `tag_key`, `tag_value` | One series per resource tag on the zone, always 1 |
+| `cloudflare_zone_requests` | | Requests |
+| `cloudflare_zone_requests_cached` | | Cached requests |
+| `cloudflare_zone_requests_ssl_encrypted` | | SSL-encrypted requests |
+| `cloudflare_zone_requests_content_type` | `content_type` | Requests by content type |
+| `cloudflare_zone_requests_country` | `country` | Requests by country |
+| `cloudflare_zone_requests_status` | `status` | Requests by HTTP status code |
+| `cloudflare_zone_requests_browser_map_page_views` | `family` | Page views by browser family |
+| `cloudflare_zone_requests_ip_class` | `ip_type` | Requests by IP classification |
+| `cloudflare_zone_requests_ssl_protocol` | `ssl_protocol` | Requests by TLS version |
+| `cloudflare_zone_requests_http_version` | `http_version` | Requests by HTTP version |
+| `cloudflare_zone_bandwidth_bytes` | | Bandwidth |
+| `cloudflare_zone_bandwidth_cached_bytes` | | Cached bandwidth |
+| `cloudflare_zone_bandwidth_ssl_encrypted_bytes` | | SSL-encrypted bandwidth |
+| `cloudflare_zone_bandwidth_content_type_bytes` | `content_type` | Bandwidth by content type |
+| `cloudflare_zone_bandwidth_country_bytes` | `country` | Bandwidth by country |
+| `cloudflare_zone_threats` | | Threats |
+| `cloudflare_zone_threats_country` | `country` | Threats by country |
+| `cloudflare_zone_threats_type` | `type` | Threats by type |
+| `cloudflare_zone_pageviews` | | Page views |
+| `cloudflare_zone_uniques` | | Unique visitors |
+| `cloudflare_zone_cache_hit_ratio` | | Cached requests / requests |
+
+Exporter self-metrics:
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `cloudflare_exporter_analytics_window_seconds` | | Configured `-analytics-window` |
+| `cloudflare_exporter_job_success` | `job` | 1 if the job's last scrape succeeded, else 0 |
+| `cloudflare_exporter_scrape_errors_total` | `job` | Cumulative failed scrapes per job |
+
+Overlapping jobs (e.g. an "all zones" job plus a "prod only" job) are safe:
+each zone is emitted once per scrape, by the first job that selects it.
 
 ### Creating an API Token
 

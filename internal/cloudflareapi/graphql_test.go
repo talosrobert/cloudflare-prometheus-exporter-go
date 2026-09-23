@@ -1,0 +1,88 @@
+package cloudflareapi
+
+import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func newTestGraphQL(t *testing.T, handler http.HandlerFunc) *Client {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	gql := NewGraphQLClient("test-token", srv.Client())
+	gql.endpoint = srv.URL
+	return &Client{gql: gql}
+}
+
+func TestGraphQLClient_Query(t *testing.T) {
+	c := newTestGraphQL(t, func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
+			t.Errorf("Authorization = %q", got)
+		}
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(req.Query, "httpRequests1mGroups") {
+			t.Error("expected HTTP metrics query body")
+		}
+		if ids, _ := req.Variables["zoneIDs"].([]any); len(ids) != 1 || ids[0] != "zone-1" {
+			t.Errorf("zoneIDs variable = %v", req.Variables["zoneIDs"])
+		}
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","httpRequests1mGroups":[{"uniq":{"uniques":7},"sum":{"requests":42,"cachedRequests":21,"responseStatusMap":[{"edgeResponseStatus":200,"requests":40}]},"dimensions":{"datetime":"2026-09-23T10:00:00Z"}}]}]}}}`))
+	})
+
+	now := time.Now()
+	got, err := c.FetchHTTPMetrics(t.Context(), []string{"zone-1"}, now.Add(-time.Minute), now, 100)
+	if err != nil {
+		t.Fatalf("FetchHTTPMetrics() error = %v", err)
+	}
+	if len(got) != 1 || !got[0].HasData {
+		t.Fatalf("got %+v, want one zone with data", got)
+	}
+	if got[0].Group.Sum.Requests != 42 || got[0].Group.Uniq.Uniques != 7 {
+		t.Errorf("unexpected values: %+v", got[0].Group)
+	}
+	if len(got[0].Group.Sum.ResponseStatusMap) != 1 || got[0].Group.Sum.ResponseStatusMap[0].EdgeResponseStatus != 200 {
+		t.Errorf("unexpected status map: %+v", got[0].Group.Sum.ResponseStatusMap)
+	}
+}
+
+func TestGraphQLClient_Errors(t *testing.T) {
+	cases := []struct {
+		name    string
+		status  int
+		body    string
+		wantErr string
+	}{
+		{"graphql errors array", http.StatusOK, `{"data":null,"errors":[{"message":"zone not found"}]}`, "zone not found"},
+		{"non-200", http.StatusBadGateway, `upstream down`, "502"},
+		{"malformed json", http.StatusOK, `{not json`, "decoding graphql response"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newTestGraphQL(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			_, err := c.FetchHTTPMetrics(t.Context(), []string{"z"}, time.Now(), time.Now(), 1)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestFetchHTTPMetrics_NoZones(t *testing.T) {
+	c := newTestGraphQL(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("no request expected for empty zone list")
+	})
+	got, err := c.FetchHTTPMetrics(t.Context(), nil, time.Now(), time.Now(), 1)
+	if err != nil || got != nil {
+		t.Fatalf("got %v, %v; want nil, nil", got, err)
+	}
+}

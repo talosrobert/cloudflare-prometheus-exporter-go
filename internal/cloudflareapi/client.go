@@ -16,11 +16,13 @@ import (
 	"github.com/cloudflare/cloudflare-go/v7/zones"
 )
 
+// Account is a Cloudflare account visible to the API token.
 type Account struct {
 	ID   string
 	Name string
 }
 
+// Zone is a Cloudflare zone and the account it belongs to.
 type Zone struct {
 	ID      string
 	Name    string
@@ -49,11 +51,14 @@ func (f TagFilter) queryString() string {
 	}
 }
 
+// Client talks to both the Cloudflare REST API (via the official SDK) and the
+// GraphQL Analytics API (via GraphQLClient) with one API token.
 type Client struct {
 	api *cloudflare.Client
 	gql *GraphQLClient
 }
 
+// NewClient builds a Client authenticated with apiToken.
 func NewClient(apiToken string) *Client {
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	return &Client{
@@ -128,11 +133,29 @@ func (c *Client) ZoneTags(ctx context.Context, accountID string, filters []TagFi
 		if item.ZoneID == "" {
 			continue
 		}
-		tags, _ := item.Tags.(map[string]string)
-		result[item.ZoneID] = tags
+		result[item.ZoneID] = tagsOf(item)
 	}
 	if err := iter.Err(); err != nil {
 		return nil, fmt.Errorf("listing zone tags for account %s: %w", accountID, err)
 	}
 	return result, nil
+}
+
+// tagsOf extracts the tag map from a tagged-resource response. The typed union
+// variant is preferred; the fallback handles the raw decoded shape, which the
+// SDK produces as map[string]any (not the map[string]string its doc comment
+// claims) because interface{} fields are filled straight from gjson.
+func tagsOf(item resource_tagging.ResourceTaggingListResponse) map[string]string {
+	if z, ok := item.AsUnion().(resource_tagging.ResourceTaggingListResponseResourceTaggingTaggedResourceObjectZone); ok && z.Tags != nil {
+		return z.Tags
+	}
+	raw, ok := item.Tags.(map[string]any)
+	if !ok {
+		return map[string]string{}
+	}
+	tags := make(map[string]string, len(raw))
+	for k, v := range raw {
+		tags[k] = fmt.Sprint(v)
+	}
+	return tags
 }

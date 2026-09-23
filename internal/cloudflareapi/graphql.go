@@ -15,12 +15,14 @@ const graphqlEndpoint = "https://api.cloudflare.com/client/v4/graphql"
 // which the official cloudflare-go SDK does not expose (it only wraps the
 // REST API; see docs/decisions.md).
 type GraphQLClient struct {
+	endpoint   string
 	apiToken   string
 	httpClient *http.Client
 }
 
+// NewGraphQLClient builds a GraphQLClient that authenticates with apiToken.
 func NewGraphQLClient(apiToken string, httpClient *http.Client) *GraphQLClient {
-	return &GraphQLClient{apiToken: apiToken, httpClient: httpClient}
+	return &GraphQLClient{endpoint: graphqlEndpoint, apiToken: apiToken, httpClient: httpClient}
 }
 
 type graphqlRequest struct {
@@ -45,7 +47,7 @@ func (c *GraphQLClient) Query(ctx context.Context, query string, variables map[s
 		return fmt.Errorf("encoding graphql request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, graphqlEndpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("building graphql request: %w", err)
 	}
@@ -56,7 +58,7 @@ func (c *GraphQLClient) Query(ctx context.Context, query string, variables map[s
 	if err != nil {
 		return fmt.Errorf("calling graphql endpoint: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
