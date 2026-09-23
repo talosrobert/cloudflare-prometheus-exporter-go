@@ -1,0 +1,24 @@
+# CLOUDFLARE_API_TOKEN must be set in the environment (e.g. from a Kubernetes
+# Secret) — it is never read from this file.
+discovery:
+  jobs:
+    # A job with no `accounts` scans every account the API token can see; a
+    # job with no `searchTags` scrapes every zone in the selected accounts.
+    - name: production-zones
+      searchTags:
+        - key: env
+          value: production
+        - key: team
+          value: platform
+
+    - name: staging-zones
+      accounts:
+        - "0123456789abcdef0123456789abcdef"
+      searchTags:
+        - key: env
+          value: staging
+
+server:
+  listenAddress: ":9199"
+  metricsPath: "/metrics"
+  scrapeTimeout: 30s

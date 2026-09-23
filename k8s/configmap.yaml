@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cloudflare-exporter-config
+data:
+  config.yaml: |
+    discovery:
+      jobs:
+        - name: production-zones
+          searchTags:
+            - key: env
+              value: production
+    server:
+      listenAddress: ":9199"
+      metricsPath: "/metrics"
+      scrapeTimeout: 30s
