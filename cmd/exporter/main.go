@@ -25,6 +25,10 @@ import (
 
 const shutdownGracePeriod = 15 * time.Second
 
+// version is overwritten at build time via -ldflags "-X main.version=...";
+// GoReleaser sets it to the release tag.
+var version = "dev"
+
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	if err := run(logger); err != nil {
@@ -38,7 +42,13 @@ func run(logger *slog.Logger) error {
 	analyticsWindow := flag.Duration("analytics-window", time.Minute, "trailing time range of HTTP analytics summed per scrape")
 	analyticsLag := flag.Duration("analytics-lag", 5*time.Minute, "how far behind now the analytics window ends, to allow for Cloudflare ingestion delay")
 	queryLimit := flag.Int("query-limit", 10000, "max GraphQL result rows requested per zone")
+	showVersion := flag.Bool("version", false, "print the exporter version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version)
+		return nil
+	}
 
 	if *analyticsWindow <= 0 {
 		return errors.New("-analytics-window must be positive")
