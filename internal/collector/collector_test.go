@@ -25,6 +25,7 @@ type fakeClient struct {
 	tags      map[string]map[string]map[string]string
 	metrics   map[string]cloudflareapi.ZoneHTTPMetrics
 	dnsGroups []cloudflareapi.DNSQueryGroup
+	wafGroups []cloudflareapi.WAFEventGroup
 
 	listZonesCalls int
 }
@@ -63,6 +64,20 @@ func (f *fakeClient) FetchHTTPMetrics(_ context.Context, zoneIDs []string, _, _ 
 	for _, id := range zoneIDs {
 		if m, ok := f.metrics[id]; ok {
 			out = append(out, m)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeClient) FetchWAFMetrics(_ context.Context, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.WAFEventGroup, error) {
+	wanted := make(map[string]bool, len(zoneIDs))
+	for _, id := range zoneIDs {
+		wanted[id] = true
+	}
+	var out []cloudflareapi.WAFEventGroup
+	for _, g := range f.wafGroups {
+		if wanted[g.ZoneTag] {
+			out = append(out, g)
 		}
 	}
 	return out, nil
@@ -111,6 +126,10 @@ func newFake() *fakeClient {
 			{ZoneTag: "zone-prod", QueryType: "A", ResponseCode: "NOERROR", Count: 10},
 			{ZoneTag: "zone-prod", QueryType: "AAAA", ResponseCode: "NOERROR", Count: 4},
 			{ZoneTag: "zone-prod", QueryType: "A", ResponseCode: "NXDOMAIN", Count: 1},
+		},
+		wafGroups: []cloudflareapi.WAFEventGroup{
+			{ZoneTag: "zone-prod", Action: "block", Source: "waf", RuleID: "rule-1", Country: "US", Count: 5},
+			{ZoneTag: "zone-prod", Action: "challenge", Source: "botManagement", RuleID: "", Country: "DE", Count: 2},
 		},
 	}
 }
@@ -428,6 +447,55 @@ func (f *unscopedDNS) FetchDNSMetrics(_ context.Context, _ string, _ []string, _
 	return f.dnsGroups, nil
 }
 
+func TestCollector_WAFMetrics(t *testing.T) {
+	job := config.DiscoveryJob{Name: "all"}
+	c := New(newFake(), []config.DiscoveryJob{job}, testOptions(), newTestLogger())
+
+	if err := testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP cloudflare_zone_firewall_events Firewall/WAF events in the analytics window (see cloudflare_exporter_analytics_window_seconds)
+# TYPE cloudflare_zone_firewall_events gauge
+cloudflare_zone_firewall_events{zone="prod.example.com",zone_id="zone-prod"} 7
+# HELP cloudflare_zone_firewall_events_action Firewall/WAF events by action in the analytics window (see cloudflare_exporter_analytics_window_seconds)
+# TYPE cloudflare_zone_firewall_events_action gauge
+cloudflare_zone_firewall_events_action{action="block",zone="prod.example.com",zone_id="zone-prod"} 5
+cloudflare_zone_firewall_events_action{action="challenge",zone="prod.example.com",zone_id="zone-prod"} 2
+# HELP cloudflare_zone_firewall_events_source Firewall/WAF events by triggering product (waf, botManagement, rateLimit, ...) in the analytics window (see cloudflare_exporter_analytics_window_seconds)
+# TYPE cloudflare_zone_firewall_events_source gauge
+cloudflare_zone_firewall_events_source{source="botManagement",zone="prod.example.com",zone_id="zone-prod"} 2
+cloudflare_zone_firewall_events_source{source="waf",zone="prod.example.com",zone_id="zone-prod"} 5
+`), "cloudflare_zone_firewall_events", "cloudflare_zone_firewall_events_action", "cloudflare_zone_firewall_events_source"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// queryLimit applies per zone (each zone's firewallEventsAdaptiveGroups call
+// gets its own limit budget inside the shared GraphQL query), so truncation
+// must be detected and reported per zone.
+func TestCollector_WAFTruncationIsPerZone(t *testing.T) {
+	fc := newFake()
+	opts := testOptions()
+	opts.QueryLimit = 2 // exactly the number of WAF rows for zone-prod in newFake()
+	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+
+	out := gather(t, c)
+	if !hasSeries(out, "cloudflare_zone_firewall_result_truncated", map[string]string{"zone": "prod.example.com"}) {
+		t.Fatal("expected a truncation series for zone-prod")
+	}
+	for _, mf := range out {
+		if mf.GetName() != "cloudflare_zone_firewall_result_truncated" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			if hasLabel(m, "zone", "prod.example.com") && m.GetGauge().GetValue() != 1 {
+				t.Errorf("zone-prod truncated = %v, want 1 (row count %d >= limit %d)", m.GetGauge().GetValue(), 2, opts.QueryLimit)
+			}
+			if hasLabel(m, "zone", "dev.example.com") && m.GetGauge().GetValue() != 0 {
+				t.Errorf("zone-dev truncated = %v, want 0 (no WAF rows at all)", m.GetGauge().GetValue())
+			}
+		}
+	}
+}
+
 func TestCollector_ScrapeErrorsAccumulate(t *testing.T) {
 	fc := newFake()
 	job := config.DiscoveryJob{Name: "broken", Accounts: []string{"missing"}}
@@ -443,6 +511,41 @@ func TestCollector_ScrapeErrorsAccumulate(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("broken")); got != 0 {
 		t.Errorf("job_success = %v, want 0", got)
+	}
+}
+
+// Unlike DNS/tags, WAF analytics needs no extra permission, so a failure here
+// must behave like an HTTP-metrics failure: fatal for the account.
+type failingWAF struct{ *fakeClient }
+
+func (f *failingWAF) FetchWAFMetrics(_ context.Context, _ []string, _, _ time.Time, _ int) ([]cloudflareapi.WAFEventGroup, error) {
+	return nil, errors.New("graphql error")
+}
+
+// A WAF fetch failure must behave like an HTTP-metrics failure (fatal for the
+// job), not like DNS/tags (fatal only for the current account, job keeps
+// going). Two accounts in one job make the difference observable: account
+// metrics already queued on the channel before the failure cannot be
+// retracted, but a fatal error must stop the job before it ever reaches the
+// second account.
+func TestCollector_WAFErrorIsFatal(t *testing.T) {
+	acct2 := cloudflareapi.Account{ID: "acct2", Name: "Account Two"}
+	fc := newFake()
+	fc.accounts = append(fc.accounts, acct2)
+	fc.zones["acct2"] = []cloudflareapi.Zone{
+		{ID: "zone-other", Name: "other.example.com", Status: "active", Account: acct2},
+	}
+	c := New(&failingWAF{fakeClient: fc}, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+	if hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": "other.example.com"}) {
+		t.Error("acct2 must never be reached once acct1's WAF fetch fails fatally")
+	}
+	if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("all")); got != 0 {
+		t.Errorf("job_success = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(c.scrapeErrors.WithLabelValues("all")); got != 1 {
+		t.Errorf("scrape_errors_total = %v, want 1", got)
 	}
 }
 

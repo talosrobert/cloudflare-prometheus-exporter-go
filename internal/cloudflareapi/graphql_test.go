@@ -107,6 +107,43 @@ func TestClient_FetchDNSMetrics(t *testing.T) {
 	}
 }
 
+func TestClient_FetchWAFMetrics(t *testing.T) {
+	c := newTestGraphQL(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(req.Query, "firewallEventsAdaptiveGroups") {
+			t.Error("expected WAF events query body")
+		}
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","firewallEventsAdaptiveGroups":[
+			{"count":5,"dimensions":{"action":"block","source":"waf","ruleId":"abc123","clientCountryName":"US"}},
+			{"count":2,"dimensions":{"action":"challenge","source":"botManagement","ruleId":"","clientCountryName":"DE"}}
+		]}]}}}`))
+	})
+
+	got, err := c.FetchWAFMetrics(t.Context(), []string{"zone-1"}, time.Now().Add(-time.Minute), time.Now(), 100)
+	if err != nil {
+		t.Fatalf("FetchWAFMetrics() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d groups, want 2: %+v", len(got), got)
+	}
+	if got[0].Count != 5 || got[0].Action != "block" || got[0].Source != "waf" || got[0].RuleID != "abc123" || got[0].Country != "US" {
+		t.Errorf("unexpected first group: %+v", got[0])
+	}
+}
+
+func TestFetchWAFMetrics_NoZones(t *testing.T) {
+	c := newTestGraphQL(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("no request expected for empty zone list")
+	})
+	got, err := c.FetchWAFMetrics(t.Context(), nil, time.Now(), time.Now(), 1)
+	if err != nil || got != nil {
+		t.Fatalf("got %v, %v; want nil, nil", got, err)
+	}
+}
+
 func TestFetchDNSMetrics_NoZones(t *testing.T) {
 	c := newTestGraphQL(t, func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("no request expected for empty zone list")

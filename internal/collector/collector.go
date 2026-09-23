@@ -44,6 +44,7 @@ type cloudflareClient interface {
 	ListZones(ctx context.Context, accountID string) ([]cloudflareapi.Zone, error)
 	ZoneTags(ctx context.Context, accountID string, filters []cloudflareapi.TagFilter) (map[string]map[string]string, error)
 	FetchHTTPMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.ZoneHTTPMetrics, error)
+	FetchWAFMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.WAFEventGroup, error)
 	FetchDNSMetrics(ctx context.Context, accountID string, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.DNSQueryGroup, error)
 }
 
@@ -109,6 +110,13 @@ type Collector struct {
 	dnsQueriesResponseCodeDesc *prometheus.Desc
 	dnsTruncatedDesc           *prometheus.Desc
 	dnsUnmatchedDesc           *prometheus.Desc
+
+	wafEventsDesc        *prometheus.Desc
+	wafEventsActionDesc  *prometheus.Desc
+	wafEventsSourceDesc  *prometheus.Desc
+	wafEventsRuleDesc    *prometheus.Desc
+	wafEventsCountryDesc *prometheus.Desc
+	wafTruncatedDesc     *prometheus.Desc
 }
 
 // New builds a Collector for the given discovery jobs.
@@ -166,6 +174,13 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 		dnsQueriesResponseCodeDesc: desc("zone_dns_queries_response_code", windowHelp("DNS queries by response code"), withLabel(zoneLabels, "response_code")),
 		dnsTruncatedDesc:           desc("exporter_dns_result_truncated", "1 if the account's DNS analytics result hit the query limit, meaning DNS metrics are undercounted", []string{"account_id"}),
 		dnsUnmatchedDesc:           desc("exporter_dns_unmatched_groups", "DNS analytics rows skipped because their zone is not in scope; Cloudflare's zone list omits type=internal zones such as workers.dev", []string{"account_id"}),
+
+		wafEventsDesc:        desc("zone_firewall_events", windowHelp("Firewall/WAF events"), zoneLabels),
+		wafEventsActionDesc:  desc("zone_firewall_events_action", windowHelp("Firewall/WAF events by action"), withLabel(zoneLabels, "action")),
+		wafEventsSourceDesc:  desc("zone_firewall_events_source", windowHelp("Firewall/WAF events by triggering product (waf, botManagement, rateLimit, ...)"), withLabel(zoneLabels, "source")),
+		wafEventsRuleDesc:    desc("zone_firewall_events_rule", windowHelp("Firewall/WAF events by rule ID — high cardinality, one series per distinct rule seen in the window"), withLabel(zoneLabels, "rule_id")),
+		wafEventsCountryDesc: desc("zone_firewall_events_country", windowHelp("Firewall/WAF events by client country"), withLabel(zoneLabels, "country")),
+		wafTruncatedDesc:     desc("zone_firewall_result_truncated", "1 if the zone's WAF event result hit the query limit, meaning WAF metrics are undercounted", zoneLabels),
 	}
 }
 
@@ -188,6 +203,7 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 		c.bandwidthSSLDesc, c.bandwidthContentTypeDesc, c.bandwidthCountryDesc, c.threatsDesc,
 		c.threatsCountryDesc, c.threatsTypeDesc, c.pageviewsDesc, c.uniquesDesc, c.cacheHitRatioDesc,
 		c.dnsQueriesDesc, c.dnsQueriesTypeDesc, c.dnsQueriesResponseCodeDesc, c.dnsTruncatedDesc, c.dnsUnmatchedDesc,
+		c.wafEventsDesc, c.wafEventsActionDesc, c.wafEventsSourceDesc, c.wafEventsRuleDesc, c.wafEventsCountryDesc, c.wafTruncatedDesc,
 	}
 }
 
@@ -344,6 +360,15 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		c.emitZoneMetrics(ch, zone, m)
 	}
 
+	// firewallEventsAdaptiveGroups needs no permission beyond what HTTP
+	// analytics already requires (verified live), so a failure here is fatal
+	// for the account just like FetchHTTPMetrics — unlike DNS/tags below.
+	wafGroups, err := c.cf.FetchWAFMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+	if err != nil {
+		return err
+	}
+	c.emitWAFMetrics(ch, zoneByID, wafGroups, c.opts.QueryLimit)
+
 	// DNS analytics needs its own API token permission that Cloudflare does not
 	// clearly document, so a token good enough for everything else still gets
 	// "not authorized for that account" here. Treat it as non-fatal: record it
@@ -379,6 +404,61 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 	}
 
 	return nil
+}
+
+// emitWAFMetrics aggregates firewall/WAF event rows by zone and by each
+// breakdown dimension. queryLimit is per zone (each zone's
+// firewallEventsAdaptiveGroups call inside the shared GraphQL query gets its
+// own limit budget), so truncation is detected per zone, not per account.
+func (c *Collector) emitWAFMetrics(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, groups []cloudflareapi.WAFEventGroup, queryLimit int) {
+	totals := make(map[string]float64)
+	rowCount := make(map[string]int)
+	byAction := make(map[dnsZoneKey]float64)
+	bySource := make(map[dnsZoneKey]float64)
+	byRule := make(map[dnsZoneKey]float64)
+	byCountry := make(map[dnsZoneKey]float64)
+
+	for _, g := range groups {
+		if _, inScope := zoneByID[g.ZoneTag]; !inScope {
+			continue
+		}
+		totals[g.ZoneTag] += g.Count
+		rowCount[g.ZoneTag]++
+		byAction[dnsZoneKey{g.ZoneTag, g.Action}] += g.Count
+		bySource[dnsZoneKey{g.ZoneTag, g.Source}] += g.Count
+		byRule[dnsZoneKey{g.ZoneTag, g.RuleID}] += g.Count
+		byCountry[dnsZoneKey{g.ZoneTag, g.Country}] += g.Count
+	}
+
+	for zoneID, zone := range zoneByID {
+		truncated := 0.0
+		if rowCount[zoneID] > 0 && rowCount[zoneID] >= queryLimit {
+			c.logger.Warn("waf analytics result hit query limit, metrics are undercounted",
+				"zone_id", zoneID, "query_limit", queryLimit)
+			truncated = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.wafTruncatedDesc, prometheus.GaugeValue, truncated, zone.ID, zone.Name)
+	}
+	for zoneID, total := range totals {
+		zone := zoneByID[zoneID]
+		ch <- prometheus.MustNewConstMetric(c.wafEventsDesc, prometheus.GaugeValue, total, zone.ID, zone.Name)
+	}
+	for key, count := range byAction {
+		zone := zoneByID[key.zoneID]
+		ch <- prometheus.MustNewConstMetric(c.wafEventsActionDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
+	}
+	for key, count := range bySource {
+		zone := zoneByID[key.zoneID]
+		ch <- prometheus.MustNewConstMetric(c.wafEventsSourceDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
+	}
+	for key, count := range byRule {
+		zone := zoneByID[key.zoneID]
+		ch <- prometheus.MustNewConstMetric(c.wafEventsRuleDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
+	}
+	for key, count := range byCountry {
+		zone := zoneByID[key.zoneID]
+		ch <- prometheus.MustNewConstMetric(c.wafEventsCountryDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
+	}
 }
 
 type dnsZoneKey struct{ zoneID, label string }

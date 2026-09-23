@@ -15,7 +15,7 @@ are not yet ported.
 ## Features
 
 - Discovers accounts/zones via the Cloudflare REST API (`cloudflare-go` SDK).
-- Pulls HTTP request and DNS query analytics via Cloudflare's GraphQL Analytics API.
+- Pulls HTTP request, DNS query, and firewall/WAF event analytics via Cloudflare's GraphQL Analytics API.
 - Filters which zones are scraped using Cloudflare's
   [Resource Tagging API](https://developers.cloudflare.com/resource-tagging/),
   with YACE-style `searchTags` job configuration (AND logic, key-only,
@@ -101,6 +101,12 @@ Labels on every zone metric: `zone_id`, `zone`.
 | `cloudflare_zone_dns_queries` | | DNS queries |
 | `cloudflare_zone_dns_queries_type` | `query_type` | DNS queries by query type (A, AAAA, MX, ...) |
 | `cloudflare_zone_dns_queries_response_code` | `response_code` | DNS queries by response code (NOERROR, NXDOMAIN, ...) |
+| `cloudflare_zone_firewall_events` | | Firewall/WAF events |
+| `cloudflare_zone_firewall_events_action` | `action` | Firewall/WAF events by action (block, challenge, log, skip, ...) |
+| `cloudflare_zone_firewall_events_source` | `source` | Firewall/WAF events by triggering product (waf, botManagement, rateLimit, ...) |
+| `cloudflare_zone_firewall_events_rule` | `rule_id` | Firewall/WAF events by rule ID — **high cardinality**, one series per distinct rule seen in the window |
+| `cloudflare_zone_firewall_events_country` | `country` | Firewall/WAF events by client country |
+| `cloudflare_zone_firewall_result_truncated` | (zone labels) | 1 if that zone's WAF event result hit `-query-limit` in this scrape |
 
 Exporter self-metrics:
 
@@ -112,6 +118,16 @@ Exporter self-metrics:
 | `cloudflare_exporter_api_errors_total` | `account_id`, `api` | Failed calls to an optional, separately permissioned API (`dns_analytics`, `resource_tagging`); non-fatal |
 | `cloudflare_exporter_dns_result_truncated` | `account_id` | 1 if DNS results hit `-query-limit`, meaning DNS metrics are undercounted |
 | `cloudflare_exporter_dns_unmatched_groups` | `account_id` | DNS rows skipped because their zone was not in scope (see internal zones below) |
+
+### WAF/firewall event labels
+
+`source` and `kind` (not currently exposed as a label) classify which Cloudflare
+security product generated the event (WAF managed/custom rules, Bot
+Management, rate limiting, etc.). Their exact string values are not filtered
+or hardcoded here — this exporter could not sample real event data with
+non-empty `source` values during development, so guessing a filter value
+risked silently returning zero rows. Use `source` as a label in PromQL instead
+of expecting this exporter to pre-filter by product.
 
 ### Partial-permission behaviour
 
