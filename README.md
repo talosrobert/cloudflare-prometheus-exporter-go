@@ -15,7 +15,7 @@ are not yet ported.
 ## Features
 
 - Discovers accounts/zones via the Cloudflare REST API (`cloudflare-go` SDK).
-- Pulls HTTP request analytics via Cloudflare's GraphQL Analytics API.
+- Pulls HTTP request and DNS query analytics via Cloudflare's GraphQL Analytics API.
 - Filters which zones are scraped using Cloudflare's
   [Resource Tagging API](https://developers.cloudflare.com/resource-tagging/),
   with YACE-style `searchTags` job configuration (AND logic, key-only,
@@ -98,6 +98,9 @@ Labels on every zone metric: `zone_id`, `zone`.
 | `cloudflare_zone_pageviews` | | Page views |
 | `cloudflare_zone_uniques` | | Unique visitors |
 | `cloudflare_zone_cache_hit_ratio` | | Cached requests / requests |
+| `cloudflare_zone_dns_queries` | | DNS queries |
+| `cloudflare_zone_dns_queries_type` | `query_type` | DNS queries by query type (A, AAAA, MX, ...) |
+| `cloudflare_zone_dns_queries_response_code` | `response_code` | DNS queries by response code (NOERROR, NXDOMAIN, ...) |
 
 Exporter self-metrics:
 
@@ -120,9 +123,13 @@ The token needs, at minimum:
 | Zone > Analytics | Read |
 | Account > Account Settings | Read |
 | Account Resource Tags (Resource Tagging) | Read |
+| Account > DNS Analytics (or similar — see below) | Read |
 
 Exact permission-group labels can shift in the Cloudflare dashboard — verify
-against your account's token creation UI.
+against your account's token creation UI. The DNS Analytics permission in
+particular isn't clearly named in Cloudflare's docs; a token without it gets
+a `"not authorized for that account"` GraphQL error scoped to
+`dnsAnalyticsAdaptiveGroups` specifically, while other metrics keep working.
 
 ## Endpoints
 

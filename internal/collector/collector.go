@@ -44,6 +44,7 @@ type cloudflareClient interface {
 	ListZones(ctx context.Context, accountID string) ([]cloudflareapi.Zone, error)
 	ZoneTags(ctx context.Context, accountID string, filters []cloudflareapi.TagFilter) (map[string]map[string]string, error)
 	FetchHTTPMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.ZoneHTTPMetrics, error)
+	FetchDNSMetrics(ctx context.Context, accountID string, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.DNSQueryGroup, error)
 }
 
 // Options tune how a Collector queries Cloudflare.
@@ -101,6 +102,10 @@ type Collector struct {
 	pageviewsDesc            *prometheus.Desc
 	uniquesDesc              *prometheus.Desc
 	cacheHitRatioDesc        *prometheus.Desc
+
+	dnsQueriesDesc             *prometheus.Desc
+	dnsQueriesTypeDesc         *prometheus.Desc
+	dnsQueriesResponseCodeDesc *prometheus.Desc
 }
 
 // New builds a Collector for the given discovery jobs.
@@ -147,6 +152,10 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 		pageviewsDesc:            desc("zone_pageviews", windowHelp("Page views"), zoneLabels),
 		uniquesDesc:              desc("zone_uniques", windowHelp("Unique visitors"), zoneLabels),
 		cacheHitRatioDesc:        desc("zone_cache_hit_ratio", windowHelp("Cache hit ratio (cached requests / requests)"), zoneLabels),
+
+		dnsQueriesDesc:             desc("zone_dns_queries", windowHelp("DNS queries"), zoneLabels),
+		dnsQueriesTypeDesc:         desc("zone_dns_queries_type", windowHelp("DNS queries by query type"), withLabel(zoneLabels, "query_type")),
+		dnsQueriesResponseCodeDesc: desc("zone_dns_queries_response_code", windowHelp("DNS queries by response code"), withLabel(zoneLabels, "response_code")),
 	}
 }
 
@@ -167,6 +176,7 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 		c.requestsSSLProtocolDesc, c.requestsHTTPVersionDesc, c.bandwidthDesc, c.bandwidthCachedDesc,
 		c.bandwidthSSLDesc, c.bandwidthContentTypeDesc, c.bandwidthCountryDesc, c.threatsDesc,
 		c.threatsCountryDesc, c.threatsTypeDesc, c.pageviewsDesc, c.uniquesDesc, c.cacheHitRatioDesc,
+		c.dnsQueriesDesc, c.dnsQueriesTypeDesc, c.dnsQueriesResponseCodeDesc,
 	}
 }
 
@@ -295,7 +305,6 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 	if err != nil {
 		return err
 	}
-
 	for _, m := range metrics {
 		if !m.HasData {
 			continue
@@ -306,7 +315,50 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		}
 		c.emitZoneMetrics(ch, zone, m)
 	}
+
+	dnsGroups, err := c.cf.FetchDNSMetrics(ctx, accountID, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+	if err != nil {
+		return err
+	}
+	c.emitDNSMetrics(ch, zoneByID, dnsGroups)
+
 	return nil
+}
+
+type dnsZoneKey struct{ zoneID, label string }
+
+func (c *Collector) emitDNSMetrics(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, groups []cloudflareapi.DNSQueryGroup) {
+	totals := make(map[string]float64)
+	byType := make(map[dnsZoneKey]float64)
+	byResponseCode := make(map[dnsZoneKey]float64)
+
+	for _, g := range groups {
+		totals[g.ZoneTag] += g.Count
+		byType[dnsZoneKey{g.ZoneTag, g.QueryType}] += g.Count
+		byResponseCode[dnsZoneKey{g.ZoneTag, g.ResponseCode}] += g.Count
+	}
+
+	for zoneID, total := range totals {
+		zone, ok := zoneByID[zoneID]
+		if !ok {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(c.dnsQueriesDesc, prometheus.GaugeValue, total, zone.ID, zone.Name)
+	}
+	for key, count := range byType {
+		zone, ok := zoneByID[key.zoneID]
+		if !ok {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(c.dnsQueriesTypeDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
+	}
+	for key, count := range byResponseCode {
+		zone, ok := zoneByID[key.zoneID]
+		if !ok {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(c.dnsQueriesResponseCodeDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
+	}
 }
 
 func (c *Collector) emitZoneMetrics(ch chan<- prometheus.Metric, zone cloudflareapi.Zone, m cloudflareapi.ZoneHTTPMetrics) {

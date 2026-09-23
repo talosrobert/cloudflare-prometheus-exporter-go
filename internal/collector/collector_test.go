@@ -21,8 +21,9 @@ type fakeClient struct {
 	zones    map[string][]cloudflareapi.Zone
 	// tags is keyed by account ID; the fake applies filters by requiring
 	// every filter key to be present with the given value.
-	tags    map[string]map[string]map[string]string
-	metrics map[string]cloudflareapi.ZoneHTTPMetrics
+	tags      map[string]map[string]map[string]string
+	metrics   map[string]cloudflareapi.ZoneHTTPMetrics
+	dnsGroups []cloudflareapi.DNSQueryGroup
 
 	listZonesCalls int
 }
@@ -66,6 +67,20 @@ func (f *fakeClient) FetchHTTPMetrics(_ context.Context, zoneIDs []string, _, _ 
 	return out, nil
 }
 
+func (f *fakeClient) FetchDNSMetrics(_ context.Context, _ string, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.DNSQueryGroup, error) {
+	wanted := make(map[string]bool, len(zoneIDs))
+	for _, id := range zoneIDs {
+		wanted[id] = true
+	}
+	var out []cloudflareapi.DNSQueryGroup
+	for _, g := range f.dnsGroups {
+		if wanted[g.ZoneTag] {
+			out = append(out, g)
+		}
+	}
+	return out, nil
+}
+
 func newTestLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -91,6 +106,11 @@ func newFake() *fakeClient {
 			"acct1": {"zone-prod": {"env": "production"}},
 		},
 		metrics: map[string]cloudflareapi.ZoneHTTPMetrics{"zone-prod": prod},
+		dnsGroups: []cloudflareapi.DNSQueryGroup{
+			{ZoneTag: "zone-prod", QueryType: "A", ResponseCode: "NOERROR", Count: 10},
+			{ZoneTag: "zone-prod", QueryType: "AAAA", ResponseCode: "NOERROR", Count: 4},
+			{ZoneTag: "zone-prod", QueryType: "A", ResponseCode: "NXDOMAIN", Count: 1},
+		},
 	}
 }
 
@@ -205,6 +225,27 @@ cloudflare_zone_requests{zone="prod.example.com",zone_id="zone-prod"} 100
 # TYPE cloudflare_zone_cache_hit_ratio gauge
 cloudflare_zone_cache_hit_ratio{zone="prod.example.com",zone_id="zone-prod"} 0.25
 `), "cloudflare_zone_requests", "cloudflare_zone_cache_hit_ratio"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCollector_DNSMetrics(t *testing.T) {
+	job := config.DiscoveryJob{Name: "all"}
+	c := New(newFake(), []config.DiscoveryJob{job}, testOptions(), newTestLogger())
+
+	if err := testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP cloudflare_zone_dns_queries DNS queries in the analytics window (see cloudflare_exporter_analytics_window_seconds)
+# TYPE cloudflare_zone_dns_queries gauge
+cloudflare_zone_dns_queries{zone="prod.example.com",zone_id="zone-prod"} 15
+# HELP cloudflare_zone_dns_queries_type DNS queries by query type in the analytics window (see cloudflare_exporter_analytics_window_seconds)
+# TYPE cloudflare_zone_dns_queries_type gauge
+cloudflare_zone_dns_queries_type{query_type="A",zone="prod.example.com",zone_id="zone-prod"} 11
+cloudflare_zone_dns_queries_type{query_type="AAAA",zone="prod.example.com",zone_id="zone-prod"} 4
+# HELP cloudflare_zone_dns_queries_response_code DNS queries by response code in the analytics window (see cloudflare_exporter_analytics_window_seconds)
+# TYPE cloudflare_zone_dns_queries_response_code gauge
+cloudflare_zone_dns_queries_response_code{response_code="NOERROR",zone="prod.example.com",zone_id="zone-prod"} 14
+cloudflare_zone_dns_queries_response_code{response_code="NXDOMAIN",zone="prod.example.com",zone_id="zone-prod"} 1
+`), "cloudflare_zone_dns_queries", "cloudflare_zone_dns_queries_type", "cloudflare_zone_dns_queries_response_code"); err != nil {
 		t.Fatal(err)
 	}
 }

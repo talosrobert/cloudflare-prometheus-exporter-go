@@ -77,6 +77,46 @@ func TestGraphQLClient_Errors(t *testing.T) {
 	}
 }
 
+func TestClient_FetchDNSMetrics(t *testing.T) {
+	c := newTestGraphQL(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(req.Query, "dnsAnalyticsAdaptiveGroups") {
+			t.Error("expected DNS analytics query body")
+		}
+		if req.Variables["accountTag"] != "acct-1" {
+			t.Errorf("accountTag variable = %v", req.Variables["accountTag"])
+		}
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"accounts":[{"dnsAnalyticsAdaptiveGroups":[
+			{"count":10,"dimensions":{"zoneTag":"zone-1","queryType":"A","responseCode":"NOERROR"}},
+			{"count":1,"dimensions":{"zoneTag":"zone-1","queryType":"A","responseCode":"NXDOMAIN"}}
+		]}]}}}`))
+	})
+
+	got, err := c.FetchDNSMetrics(t.Context(), "acct-1", []string{"zone-1"}, time.Now().Add(-time.Minute), time.Now(), 100)
+	if err != nil {
+		t.Fatalf("FetchDNSMetrics() error = %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d groups, want 2: %+v", len(got), got)
+	}
+	if got[0].Count != 10 || got[0].QueryType != "A" || got[0].ResponseCode != "NOERROR" {
+		t.Errorf("unexpected first group: %+v", got[0])
+	}
+}
+
+func TestFetchDNSMetrics_NoZones(t *testing.T) {
+	c := newTestGraphQL(t, func(_ http.ResponseWriter, _ *http.Request) {
+		t.Fatal("no request expected for empty zone list")
+	})
+	got, err := c.FetchDNSMetrics(t.Context(), "acct-1", nil, time.Now(), time.Now(), 1)
+	if err != nil || got != nil {
+		t.Fatalf("got %v, %v; want nil, nil", got, err)
+	}
+}
+
 func TestFetchHTTPMetrics_NoZones(t *testing.T) {
 	c := newTestGraphQL(t, func(_ http.ResponseWriter, _ *http.Request) {
 		t.Fatal("no request expected for empty zone list")
