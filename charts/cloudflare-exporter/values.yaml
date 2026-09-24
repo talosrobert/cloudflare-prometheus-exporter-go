@@ -1,10 +1,18 @@
 replicaCount: 1
 
 image:
-  repository: cloudflare-prometheus-exporter-go
+  repository: ghcr.io/talosrobert/cloudflare-prometheus-exporter-go
   # Defaults to Chart.AppVersion when empty.
   tag: ""
   pullPolicy: IfNotPresent
+
+serviceAccount:
+  create: true
+  annotations: {}
+  # Defaults to the chart's fullname when empty.
+  name: ""
+  # This exporter only calls the Cloudflare API, never the Kubernetes API.
+  automountServiceAccountToken: false
 
 # CLOUDFLARE_API_TOKEN source. Set exactly one:
 # - existingSecret: reference a Secret you created yourself (recommended).

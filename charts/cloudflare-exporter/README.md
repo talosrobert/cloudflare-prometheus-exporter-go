@@ -37,6 +37,10 @@ first — the chart does not build or push images itself.
 | `service.type` | `ClusterIP` | |
 | `service.port` | `9199` | Also the container port and `config.yaml`'s `listenAddress`. |
 | `service.annotations` | `prometheus.io/scrape` etc. | Set for non-Operator Prometheus discovery. |
+| `serviceAccount.create` | `true` | Create a dedicated ServiceAccount for the Deployment. |
+| `serviceAccount.annotations` | `{}` | e.g. for IRSA/Workload Identity, if ever needed. |
+| `serviceAccount.name` | `""` | Defaults to the chart's fullname when empty; ignored (uses `default`) if `create` is `false`. |
+| `serviceAccount.automountServiceAccountToken` | `false` | The exporter only calls the Cloudflare API, never the Kubernetes API. |
 | `serviceMonitor.enabled` | `false` | Requires the Prometheus Operator CRDs. |
 | `serviceMonitor.interval` / `.scrapeTimeout` | `60s` / `30s` | |
 | `resources` | `50m`/`64Mi` requests, `256Mi` limit | |
@@ -46,7 +50,9 @@ first — the chart does not build or push images itself.
 
 ## Notes
 
-- No `serviceAccount` is created — the Deployment runs under the namespace's default one.
+- The Deployment runs under its own ServiceAccount (`serviceAccount.create: true`), with
+  its token not automounted since the exporter never talks to the Kubernetes API. Set
+  `serviceAccount.create: false` to run under an existing/default ServiceAccount instead.
 - The Pod won't scrape successfully without a token: set `apiToken.existingSecret` (or
   `apiToken.value` for a quick try) before installing, or see the post-install NOTES output.
 - Changing `exporter.configPath` moves both the ConfigMap key and the volume mount path with

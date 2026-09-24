@@ -1,9 +1,10 @@
 FROM golang:1.26-alpine AS builder
 WORKDIR /src
+ARG VERSION=dev
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/cloudflare-exporter ./cmd/exporter
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/cloudflare-exporter ./cmd/exporter
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates && \

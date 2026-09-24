@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   goreleaser:
@@ -26,6 +27,11 @@ jobs:
             echo "Chart.yaml appVersion is '$app' but tag is '$tag' — run: make bump VERSION=$tag, commit, re-tag" >&2
             exit 1
           fi
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: goreleaser/goreleaser-action@v6
         with:
           distribution: goreleaser

@@ -45,3 +45,14 @@ Name of the Secret holding CLOUDFLARE_API_TOKEN, whichever apiToken.* mode is in
 {{- define "cloudflare-exporter.secretName" -}}
 {{- .Values.apiToken.existingSecret | default (printf "%s-token" (include "cloudflare-exporter.fullname" .)) -}}
 {{- end -}}
+
+{{/*
+Name of the ServiceAccount to use, whichever serviceAccount.* mode is in use.
+*/}}
+{{- define "cloudflare-exporter.serviceAccountName" -}}
+{{- if .Values.serviceAccount.create -}}
+{{- default (include "cloudflare-exporter.fullname" .) .Values.serviceAccount.name -}}
+{{- else -}}
+{{- default "default" .Values.serviceAccount.name -}}
+{{- end -}}
+{{- end -}}

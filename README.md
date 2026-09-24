@@ -232,7 +232,10 @@ helm install cloudflare-exporter charts/cloudflare-exporter \
 See the chart's README for the full values reference (discovery jobs, `serviceMonitor`,
 resources, tolerations, ...).
 
-Build and push the image with the provided `Containerfile`:
+Pre-built images are published to `ghcr.io/talosrobert/cloudflare-prometheus-exporter-go:vX.Y.Z`
+on every tagged release — the chart's default `image.repository` already points there.
+
+To build your own instead, use the provided `Containerfile`:
 
 ```sh
 podman build -t <your-registry>/cloudflare-prometheus-exporter-go:latest -f Containerfile .

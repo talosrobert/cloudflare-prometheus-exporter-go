@@ -15,6 +15,16 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}}
 
+dockers:
+  - id: cloudflare-exporter
+    ids: [cloudflare-exporter]
+    dockerfile: Containerfile
+    image_templates:
+      - "ghcr.io/talosrobert/cloudflare-prometheus-exporter-go:{{ .Tag }}"
+      - "ghcr.io/talosrobert/cloudflare-prometheus-exporter-go:latest"
+    build_flag_templates:
+      - "--build-arg=VERSION={{ .Version }}"
+
 archives:
   - id: cloudflare-exporter
     formats: [tar.gz]
