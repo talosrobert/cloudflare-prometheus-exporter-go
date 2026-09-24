@@ -76,6 +76,8 @@ securityContext:
   readOnlyRootFilesystem: true
   capabilities:
     drop: ["ALL"]
+  # matches USER 10001 in Containerfile.release
+  runAsUser: 10001
 
 nodeSelector: {}
 tolerations: []

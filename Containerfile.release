@@ -2,7 +2,7 @@ FROM alpine:3.24
 RUN apk add --no-cache ca-certificates && \
     adduser -D -u 10001 exporter
 COPY cloudflare-exporter /usr/local/bin/cloudflare-exporter
-USER exporter
+USER 10001
 EXPOSE 9199
 ENTRYPOINT ["/usr/local/bin/cloudflare-exporter"]
 CMD ["-config=/etc/cloudflare-exporter/config.yaml"]
