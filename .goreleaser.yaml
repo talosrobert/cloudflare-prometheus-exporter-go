@@ -18,12 +18,10 @@ builds:
 dockers:
   - id: cloudflare-exporter
     ids: [cloudflare-exporter]
-    dockerfile: Containerfile
+    dockerfile: Containerfile.release
     image_templates:
       - "ghcr.io/talosrobert/cloudflare-prometheus-exporter-go:{{ .Tag }}"
       - "ghcr.io/talosrobert/cloudflare-prometheus-exporter-go:latest"
-    build_flag_templates:
-      - "--build-arg=VERSION={{ .Version }}"
 
 archives:
   - id: cloudflare-exporter

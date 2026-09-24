@@ -6,7 +6,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/cloudflare-exporter ./cmd/exporter
 
-FROM alpine:3.21
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates && \
     adduser -D -u 10001 exporter
 COPY --from=builder /out/cloudflare-exporter /usr/local/bin/cloudflare-exporter
