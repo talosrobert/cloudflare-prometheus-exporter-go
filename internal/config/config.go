@@ -42,6 +42,46 @@ type DiscoveryJob struct {
 	// SearchTags restrict scraped zones to those matching ALL filters (AND logic).
 	// Empty means every zone in the selected accounts is scraped.
 	SearchTags []TagFilter `yaml:"searchTags,omitempty"`
+	// MetricGroups lists which analytics groups to collect for this job's
+	// zones: zone, dns, firewall, errors. Empty means all four. A dropped
+	// group skips its Cloudflare API call, not just its metrics.
+	MetricGroups []string `yaml:"metricGroups,omitempty"`
+	// Groups is MetricGroups resolved to booleans by Load. A DiscoveryJob
+	// built directly (e.g. in tests, bypassing Load) gets the zero value,
+	// which enables every group.
+	Groups MetricGroups `yaml:"-"`
+}
+
+// MetricGroups is DiscoveryJob.MetricGroups resolved to booleans. The zero
+// value enables every group, so a DiscoveryJob built without going through
+// Load (e.g. in tests) keeps the exporter's original always-collect-everything
+// behavior.
+type MetricGroups struct {
+	DisableZone, DisableDNS, DisableFirewall, DisableErrors bool
+}
+
+// validMetricGroupNames is the exhaustive set DiscoveryJob.MetricGroups accepts.
+var validMetricGroupNames = map[string]bool{"zone": true, "dns": true, "firewall": true, "errors": true}
+
+// resolveMetricGroups turns a job's MetricGroups list into MetricGroups.
+// An empty list enables every group.
+func resolveMetricGroups(names []string) (MetricGroups, error) {
+	if len(names) == 0 {
+		return MetricGroups{}, nil
+	}
+	enabled := make(map[string]bool, len(names))
+	for _, name := range names {
+		if !validMetricGroupNames[name] {
+			return MetricGroups{}, fmt.Errorf("unknown metric group %q, must be one of zone, dns, firewall, errors", name)
+		}
+		enabled[name] = true
+	}
+	return MetricGroups{
+		DisableZone:     !enabled["zone"],
+		DisableDNS:      !enabled["dns"],
+		DisableFirewall: !enabled["firewall"],
+		DisableErrors:   !enabled["errors"],
+	}, nil
 }
 
 // ServerConfig controls the exporter's own HTTP listener.
@@ -96,7 +136,8 @@ func Load(path string) (*Config, error) {
 	if len(cfg.Discovery.Jobs) == 0 {
 		return nil, fmt.Errorf("config must define at least one discovery.jobs entry")
 	}
-	for i, job := range cfg.Discovery.Jobs {
+	for i := range cfg.Discovery.Jobs {
+		job := &cfg.Discovery.Jobs[i]
 		if job.Name == "" {
 			return nil, fmt.Errorf("discovery.jobs[%d]: name is required", i)
 		}
@@ -105,6 +146,11 @@ func Load(path string) (*Config, error) {
 				return nil, fmt.Errorf("discovery.jobs[%d].searchTags[%d]: key is required", i, j)
 			}
 		}
+		groups, err := resolveMetricGroups(job.MetricGroups)
+		if err != nil {
+			return nil, fmt.Errorf("discovery.jobs[%d].metricGroups: %w", i, err)
+		}
+		job.Groups = groups
 	}
 
 	return &cfg, nil

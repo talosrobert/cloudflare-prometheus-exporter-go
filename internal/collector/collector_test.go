@@ -29,7 +29,11 @@ type fakeClient struct {
 	wafGroups   []cloudflareapi.WAFEventGroup
 	errorGroups []cloudflareapi.ErrorGroup
 
-	listZonesCalls int
+	listZonesCalls    int
+	httpMetricsCalls  int
+	wafMetricsCalls   int
+	dnsMetricsCalls   int
+	errorMetricsCalls int
 }
 
 func (f *fakeClient) ListAccounts(_ context.Context) ([]cloudflareapi.Account, error) {
@@ -62,6 +66,7 @@ func matches(tags map[string]string, filters []cloudflareapi.TagFilter) bool {
 }
 
 func (f *fakeClient) FetchHTTPMetrics(_ context.Context, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.ZoneHTTPMetrics, error) {
+	f.httpMetricsCalls++
 	var out []cloudflareapi.ZoneHTTPMetrics
 	for _, id := range zoneIDs {
 		if m, ok := f.metrics[id]; ok {
@@ -72,6 +77,7 @@ func (f *fakeClient) FetchHTTPMetrics(_ context.Context, zoneIDs []string, _, _ 
 }
 
 func (f *fakeClient) FetchWAFMetrics(_ context.Context, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.WAFEventGroup, error) {
+	f.wafMetricsCalls++
 	wanted := make(map[string]bool, len(zoneIDs))
 	for _, id := range zoneIDs {
 		wanted[id] = true
@@ -86,6 +92,7 @@ func (f *fakeClient) FetchWAFMetrics(_ context.Context, zoneIDs []string, _, _ t
 }
 
 func (f *fakeClient) FetchDNSMetrics(_ context.Context, _ string, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.DNSQueryGroup, error) {
+	f.dnsMetricsCalls++
 	wanted := make(map[string]bool, len(zoneIDs))
 	for _, id := range zoneIDs {
 		wanted[id] = true
@@ -100,6 +107,7 @@ func (f *fakeClient) FetchDNSMetrics(_ context.Context, _ string, zoneIDs []stri
 }
 
 func (f *fakeClient) FetchErrorMetrics(_ context.Context, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.ErrorGroup, error) {
+	f.errorMetricsCalls++
 	wanted := make(map[string]bool, len(zoneIDs))
 	for _, id := range zoneIDs {
 		wanted[id] = true
@@ -573,6 +581,43 @@ cloudflare_zone_firewall_events_source{source="botManagement",zone="prod.example
 cloudflare_zone_firewall_events_source{source="waf",zone="prod.example.com",zone_id="zone-prod"} 5
 `), "cloudflare_zone_firewall_events", "cloudflare_zone_firewall_events_action", "cloudflare_zone_firewall_events_source"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A job's metricGroups is per-account: dropping a group must skip its
+// Cloudflare API call entirely, not just filter the resulting metrics.
+func TestCollector_MetricGroupsSkipsFetchAndMetrics(t *testing.T) {
+	fc := newFake()
+	job := config.DiscoveryJob{Name: "zone-only", Groups: config.MetricGroups{
+		DisableDNS: true, DisableFirewall: true, DisableErrors: true,
+	}}
+	c := New(fc, []config.DiscoveryJob{job}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+
+	if fc.dnsMetricsCalls != 0 {
+		t.Errorf("dnsMetricsCalls = %d, want 0", fc.dnsMetricsCalls)
+	}
+	if fc.wafMetricsCalls != 0 {
+		t.Errorf("wafMetricsCalls = %d, want 0", fc.wafMetricsCalls)
+	}
+	if fc.errorMetricsCalls != 0 {
+		t.Errorf("errorMetricsCalls = %d, want 0", fc.errorMetricsCalls)
+	}
+	if fc.httpMetricsCalls == 0 {
+		t.Error("httpMetricsCalls = 0, want at least 1 (zone group still enabled)")
+	}
+	if !hasSeries(out, "cloudflare_zone_requests", map[string]string{"zone": "prod.example.com"}) {
+		t.Error("expected cloudflare_zone_requests, zone group is enabled")
+	}
+	for _, name := range []string{
+		"cloudflare_zone_dns_queries",
+		"cloudflare_zone_firewall_events",
+		"cloudflare_zone_requests_customer_error",
+	} {
+		if findFamily(out, name) != nil {
+			t.Errorf("found %s series, want none (its group is disabled)", name)
+		}
 	}
 }
 

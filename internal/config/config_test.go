@@ -64,6 +64,49 @@ func TestLoad_NoJobs(t *testing.T) {
 	}
 }
 
+func TestLoad_MetricGroupsDefaultsToAllEnabled(t *testing.T) {
+	t.Setenv(apiTokenEnvVar, "test-token")
+	path := writeConfig(t, "discovery:\n  jobs:\n    - name: x\n")
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Discovery.Jobs[0].Groups; got != (MetricGroups{}) {
+		t.Errorf("Groups = %+v, want zero value (all enabled)", got)
+	}
+}
+
+func TestLoad_MetricGroupsSubset(t *testing.T) {
+	t.Setenv(apiTokenEnvVar, "test-token")
+	path := writeConfig(t, `
+discovery:
+  jobs:
+    - name: x
+      metricGroups:
+        - dns
+        - firewall
+`)
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := MetricGroups{DisableZone: true, DisableErrors: true}
+	if got := cfg.Discovery.Jobs[0].Groups; got != want {
+		t.Errorf("Groups = %+v, want %+v", got, want)
+	}
+}
+
+func TestLoad_MetricGroupsUnknownName(t *testing.T) {
+	t.Setenv(apiTokenEnvVar, "test-token")
+	path := writeConfig(t, "discovery:\n  jobs:\n    - name: x\n      metricGroups: [bogus]\n")
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for unknown metric group, got nil")
+	}
+}
+
 func TestTagFilter_QueryString(t *testing.T) {
 	cases := []struct {
 		name string

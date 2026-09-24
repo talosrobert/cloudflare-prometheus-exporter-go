@@ -41,11 +41,19 @@ discovery:
           value: production
         - key: archived
           negate: true      # tag=!archived
+      metricGroups:        # optional; omit for all four: zone, dns, firewall, errors
+        - zone
+        - firewall
 server:
   listenAddress: ":9199"
   metricsPath: "/metrics"
   scrapeTimeout: 30s
 ```
+
+A job's `metricGroups` also skips the corresponding Cloudflare API calls, not
+just the metrics. Zones are deduplicated across jobs: when two jobs select the
+same zone, the first job in config order claims it and its `metricGroups`
+apply — a later job's differing `metricGroups` are ignored for that zone.
 
 The Cloudflare API token is **not** read from this file — set it via the
 `CLOUDFLARE_API_TOKEN` environment variable (in Kubernetes, from a Secret; see the

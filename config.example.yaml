@@ -17,6 +17,15 @@ discovery:
       searchTags:
         - key: env
           value: staging
+      # metricGroups picks which analytics groups to collect for this job's
+      # accounts: zone, dns, firewall, errors (exact lowercase names). Omit
+      # for all four. A dropped group skips its Cloudflare API call, not just
+      # its metrics. When two jobs select the same zone, the first job in
+      # this list claims it and its metricGroups win — a later job's
+      # differing metricGroups are ignored for that zone.
+      metricGroups:
+        - dns
+        - firewall
 
 server:
   listenAddress: ":9199"

@@ -237,6 +237,12 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 // results, and the set of zones already emitted so that overlapping jobs
 // (e.g. "all zones" plus "prod only") never produce duplicate series, which
 // would make the registry reject the entire scrape.
+//
+// The dedup is per zone, not per (zone, metric group): when two jobs select
+// the same zone, the first job in config order claims it, and its
+// metricGroups decide what gets collected for it — a later job's differing
+// metricGroups are silently ignored for that zone. Give overlapping jobs the
+// same metricGroups, or keep their zone sets disjoint.
 type scrape struct {
 	mintime, maxtime time.Time
 	zonesByAccount   map[string][]cloudflareapi.Zone
@@ -324,14 +330,14 @@ func (c *Collector) collectJob(ctx context.Context, ch chan<- prometheus.Metric,
 			continue
 		}
 		seen[accountID] = true
-		if err := c.collectAccount(ctx, ch, s, accountID, filters); err != nil {
+		if err := c.collectAccount(ctx, ch, s, accountID, filters, job.Groups); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Metric, s *scrape, accountID string, filters []cloudflareapi.TagFilter) error {
+func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Metric, s *scrape, accountID string, filters []cloudflareapi.TagFilter, groups config.MetricGroups) error {
 	zones, ok := s.zonesByAccount[accountID]
 	if !ok {
 		var err error
@@ -389,73 +395,81 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		}
 	}
 
-	metrics, err := c.cf.FetchHTTPMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
-	if err != nil {
-		return err
-	}
-	for _, m := range metrics {
-		if !m.HasData {
-			continue
+	if !groups.DisableZone {
+		metrics, err := c.cf.FetchHTTPMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+		if err != nil {
+			return err
 		}
-		zone, ok := zoneByID[m.ZoneTag]
-		if !ok {
-			continue
+		for _, m := range metrics {
+			if !m.HasData {
+				continue
+			}
+			zone, ok := zoneByID[m.ZoneTag]
+			if !ok {
+				continue
+			}
+			c.emitZoneMetrics(ch, zone, m)
 		}
-		c.emitZoneMetrics(ch, zone, m)
 	}
 
-	// firewallEventsAdaptiveGroups needs no permission beyond what HTTP
-	// analytics already requires (verified live), so a failure here is fatal
-	// for the account just like FetchHTTPMetrics — unlike DNS/tags below.
-	wafGroups, err := c.cf.FetchWAFMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
-	if err != nil {
-		return err
+	if !groups.DisableFirewall {
+		// firewallEventsAdaptiveGroups needs no permission beyond what HTTP
+		// analytics already requires (verified live), so a failure here is fatal
+		// for the account just like FetchHTTPMetrics — unlike DNS/tags below.
+		wafGroups, err := c.cf.FetchWAFMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+		if err != nil {
+			return err
+		}
+		c.emitWAFMetrics(ch, zoneByID, wafGroups, c.opts.QueryLimit)
 	}
-	c.emitWAFMetrics(ch, zoneByID, wafGroups, c.opts.QueryLimit)
 
-	// httpRequestsAdaptiveGroups needs no permission beyond what HTTP analytics
-	// already requires (verified live), so a failure here is fatal for the
-	// account just like FetchHTTPMetrics/FetchWAFMetrics.
-	errorGroups, err := c.cf.FetchErrorMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
-	if err != nil {
-		return err
+	if !groups.DisableErrors {
+		// httpRequestsAdaptiveGroups needs no permission beyond what HTTP analytics
+		// already requires (verified live), so a failure here is fatal for the
+		// account just like FetchHTTPMetrics/FetchWAFMetrics.
+		errorGroups, err := c.cf.FetchErrorMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+		if err != nil {
+			return err
+		}
+		c.emitErrorMetrics(ch, zoneByID, errorGroups, c.opts.QueryLimit, c.opts.ExcludeHost)
 	}
-	c.emitErrorMetrics(ch, zoneByID, errorGroups, c.opts.QueryLimit, c.opts.ExcludeHost)
 
-	// DNS analytics needs its own API token permission that Cloudflare does not
-	// clearly document, so a token good enough for everything else still gets
-	// "not authorized for that account" here. Treat it as non-fatal: record it
-	// and keep the metrics that did work.
-	dnsGroups, err := c.cf.FetchDNSMetrics(ctx, accountID, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
-	if err != nil {
-		c.logger.Warn("dns analytics unavailable", "account_id", accountID, "error", err)
-		c.apiErrors.WithLabelValues(accountID, "dns_analytics").Inc()
-		return nil
-	}
-	// Groups are one row per (zone, query type, response code); Cloudflare
-	// truncates silently at the limit, which would undercount every DNS metric
-	// below, so surface it instead of reporting wrong numbers quietly.
-	st := s.dns[accountID]
-	if st == nil {
-		st = &dnsAccountState{unmatched: make(map[cloudflareapi.DNSQueryGroup]struct{})}
-		s.dns[accountID] = st
-	}
-	if len(dnsGroups) > 0 && len(dnsGroups) >= c.opts.QueryLimit {
-		c.logger.Warn("dns analytics result hit query limit, metrics are undercounted",
-			"account_id", accountID, "query_limit", c.opts.QueryLimit)
-		st.truncated = true
-	}
-	unmatched := c.emitDNSMetrics(ch, zoneByID, dnsGroups)
-	if len(unmatched) > 0 {
-		// Cloudflare's zone list omits type=internal zones (workers.dev and
-		// friends) while DNS analytics still reports their traffic, so those
-		// rows have no zone to attach to. Report it rather than dropping the
-		// data silently.
-		c.logger.Warn("dns analytics rows skipped, zone not in scope for this scrape",
-			"account_id", accountID, "rows", len(unmatched), "example_zone_id", unmatched[0].ZoneTag)
-	}
-	for _, g := range unmatched {
-		st.unmatched[g] = struct{}{}
+	if !groups.DisableDNS {
+		// DNS analytics needs its own API token permission that Cloudflare does not
+		// clearly document, so a token good enough for everything else still gets
+		// "not authorized for that account" here. Treat it as non-fatal: record it
+		// and keep the metrics that did work.
+		dnsGroups, err := c.cf.FetchDNSMetrics(ctx, accountID, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+		if err != nil {
+			c.logger.Warn("dns analytics unavailable", "account_id", accountID, "error", err)
+			c.apiErrors.WithLabelValues(accountID, "dns_analytics").Inc()
+			return nil
+		}
+		// Groups are one row per (zone, query type, response code); Cloudflare
+		// truncates silently at the limit, which would undercount every DNS metric
+		// below, so surface it instead of reporting wrong numbers quietly.
+		st := s.dns[accountID]
+		if st == nil {
+			st = &dnsAccountState{unmatched: make(map[cloudflareapi.DNSQueryGroup]struct{})}
+			s.dns[accountID] = st
+		}
+		if len(dnsGroups) > 0 && len(dnsGroups) >= c.opts.QueryLimit {
+			c.logger.Warn("dns analytics result hit query limit, metrics are undercounted",
+				"account_id", accountID, "query_limit", c.opts.QueryLimit)
+			st.truncated = true
+		}
+		unmatched := c.emitDNSMetrics(ch, zoneByID, dnsGroups)
+		if len(unmatched) > 0 {
+			// Cloudflare's zone list omits type=internal zones (workers.dev and
+			// friends) while DNS analytics still reports their traffic, so those
+			// rows have no zone to attach to. Report it rather than dropping the
+			// data silently.
+			c.logger.Warn("dns analytics rows skipped, zone not in scope for this scrape",
+				"account_id", accountID, "rows", len(unmatched), "example_zone_id", unmatched[0].ZoneTag)
+		}
+		for _, g := range unmatched {
+			st.unmatched[g] = struct{}{}
+		}
 	}
 
 	return nil
