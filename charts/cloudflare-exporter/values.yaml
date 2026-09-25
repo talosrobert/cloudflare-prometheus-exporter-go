@@ -47,6 +47,12 @@ service:
     prometheus.io/scrape: "true"
     prometheus.io/port: "9199"
     prometheus.io/path: "/metrics"
+    # This exporter has no independent poll loop — every scrape queries
+    # Cloudflare directly, so the scrape interval is the Cloudflare API call
+    # rate. Raise these to reduce Cloudflare API pressure/avoid rate-limiting
+    # (matches serviceMonitor.interval/.scrapeTimeout's defaults below).
+    prometheus.io/interval: "60s"
+    prometheus.io/scrape-timeout: "30s"
 
 # Requires the Prometheus Operator CRDs.
 serviceMonitor:

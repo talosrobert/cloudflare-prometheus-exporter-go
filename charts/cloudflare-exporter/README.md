@@ -35,7 +35,7 @@ first — the chart does not build or push images itself.
 | `exporter.discovery.jobs` | one `production-zones` job, `env=production` | Rendered verbatim into `config.yaml`'s `discovery.jobs` — see the main [README](../../README.md#configuration) for the `searchTags`/`accounts` shape. |
 | `service.type` | `ClusterIP` | |
 | `service.port` | `9199` | Also the container port and `config.yaml`'s `listenAddress`. |
-| `service.annotations` | `prometheus.io/scrape` etc. | Set for non-Operator Prometheus discovery. |
+| `service.annotations` | `prometheus.io/scrape`, `/port`, `/path`, `/interval` (`60s`), `/scrape-timeout` (`30s`) | Set for non-Operator Prometheus discovery. `interval`/`scrape-timeout` are honored only if your scrape config maps them to `__scrape_interval__`/`__scrape_timeout__` — a common but not universal convention. |
 | `serviceAccount.create` | `true` | Create a dedicated ServiceAccount for the Deployment. |
 | `serviceAccount.annotations` | `{}` | e.g. for IRSA/Workload Identity, if ever needed. |
 | `serviceAccount.name` | `""` | Defaults to the chart's fullname when empty; ignored (uses `default`) if `create` is `false`. |
@@ -49,6 +49,13 @@ first — the chart does not build or push images itself.
 
 ## Notes
 
+- This exporter has no independent poll loop: every scrape queries Cloudflare
+  directly, so the scrape interval **is** the Cloudflare API call rate.
+  Raise `service.annotations`' `prometheus.io/interval` (annotation-based
+  discovery) or `serviceMonitor.interval` (Operator discovery) — whichever
+  your Prometheus uses — to reduce Cloudflare API pressure or avoid
+  rate-limiting. Keep `exporter.analyticsWindow` matched to it, or you'll
+  reopen the under-counting gap described in the main README.
 - The Deployment runs under its own ServiceAccount (`serviceAccount.create: true`), with
   its token not automounted since the exporter never talks to the Kubernetes API. Set
   `serviceAccount.create: false` to run under an existing/default ServiceAccount instead.

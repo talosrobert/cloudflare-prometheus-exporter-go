@@ -68,6 +68,18 @@ Command-line flags (all optional):
 | `-analytics-lag` | `5m` | How far behind "now" the window ends, allowing for Cloudflare's ingestion delay |
 | `-query-limit` | `10000` | Max GraphQL result rows requested per zone |
 
+### Scrape interval and Cloudflare rate limits
+
+There is no separate fetch/poll interval: this exporter has no background
+cache, so whatever scrapes `/metrics` — a plain Prometheus `scrape_interval`,
+a ServiceMonitor's `interval`, or a `prometheus.io/interval` annotation for
+non-Operator discovery — directly controls how often Cloudflare's GraphQL
+Analytics API gets called. Widen it if you're hitting Cloudflare's rate
+limits. If you do, raise `-analytics-window` to match, or you'll under-count:
+`httpRequests1mGroups` (backing `cloudflare_zone_requests` etc.) returns at
+most one 1-minute bucket per query, so a scrape interval wider than the
+window silently skips the traffic in between.
+
 ## Metrics
 
 All `cloudflare_zone_*` analytics metrics are **gauges holding the sum over
