@@ -152,8 +152,8 @@ func TestClient_FetchErrorMetrics(t *testing.T) {
 			t.Error("expected error-metrics query body")
 		}
 		_, _ = w.Write([]byte(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","httpRequestsAdaptiveGroups":[
-			{"count":3,"avg":{"originResponseDurationMs":120,"sampleInterval":1},"sum":{"edgeRequestBytes":150,"edgeResponseBytes":900},"dimensions":{"edgeResponseStatus":500,"originResponseStatus":500,"clientCountryName":"US","clientRequestHTTPHost":"example.com"}},
-			{"count":5,"avg":{"originResponseDurationMs":-1,"sampleInterval":10},"sum":{"edgeRequestBytes":50,"edgeResponseBytes":200},"dimensions":{"edgeResponseStatus":403,"originResponseStatus":0,"clientCountryName":"FR","clientRequestHTTPHost":"example.com"}}
+			{"count":3,"avg":{"originResponseDurationMs":120,"sampleInterval":1},"sum":{"edgeRequestBytes":150,"edgeResponseBytes":900},"dimensions":{"edgeResponseStatus":500,"originResponseStatus":500,"clientCountryName":"US","clientRequestHTTPHost":"example.com","wafAttackScoreClass":"attack","botManagementDecision":"automated","verifiedBotCategory":""}},
+			{"count":5,"avg":{"originResponseDurationMs":-1,"sampleInterval":10},"sum":{"edgeRequestBytes":50,"edgeResponseBytes":200},"dimensions":{"edgeResponseStatus":403,"originResponseStatus":0,"clientCountryName":"FR","clientRequestHTTPHost":"example.com","wafAttackScoreClass":"clean","botManagementDecision":"verified_bot","verifiedBotCategory":"Search Engine Crawler"}}
 		]}]}}}`))
 	})
 
@@ -170,6 +170,9 @@ func TestClient_FetchErrorMetrics(t *testing.T) {
 	if got[0].EdgeRequestBytes != 150 || got[0].EdgeResponseBytes != 900 {
 		t.Errorf("unsampled group bytes = %+v, want EdgeRequestBytes=150 EdgeResponseBytes=900 (sampleInterval 1)", got[0])
 	}
+	if got[0].WAFAttackScoreClass != "attack" || got[0].BotManagementDecision != "automated" || got[0].VerifiedBotCategory != "" {
+		t.Errorf("unexpected first group security fields: %+v", got[0])
+	}
 	if got[1].OriginStatus != 0 || got[1].AvgOriginDurationMs != -1 {
 		t.Errorf("unexpected second group (origin not contacted): %+v", got[1])
 	}
@@ -178,6 +181,9 @@ func TestClient_FetchErrorMetrics(t *testing.T) {
 	}
 	if got[1].EdgeRequestBytes != 500 || got[1].EdgeResponseBytes != 2000 {
 		t.Errorf("sampled group bytes = %+v, want EdgeRequestBytes=500 EdgeResponseBytes=2000 (raw × sampleInterval 10)", got[1])
+	}
+	if got[1].WAFAttackScoreClass != "clean" || got[1].BotManagementDecision != "verified_bot" || got[1].VerifiedBotCategory != "Search Engine Crawler" {
+		t.Errorf("unexpected second group security fields: %+v", got[1])
 	}
 }
 

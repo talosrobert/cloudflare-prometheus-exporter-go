@@ -23,6 +23,13 @@ import (
 // extra API call) to back the by-host request/bandwidth metrics — this is the
 // only dataset with a host dimension at all, since httpRequests1mGroups has
 // none.
+//
+// wafAttackScoreClass/botManagementDecision/verifiedBotCategory likewise ride
+// along to back the security-analytics metrics. Values confirmed live against
+// a real zone: each is a small, bounded set of categories (4-8 distinct
+// values), not a per-request field, so labeling by them directly is safe —
+// unlike wafAttackScore itself (a raw 0-100 score), which would blow up
+// cardinality if used as a label instead of the pre-bucketed *Class field.
 const errorMetricsQuery = `
 query ErrorMetrics($zoneIDs: [string!], $mintime: Time!, $maxtime: Time!, $limit: uint64!) {
   viewer {
@@ -46,6 +53,9 @@ query ErrorMetrics($zoneIDs: [string!], $mintime: Time!, $maxtime: Time!, $limit
           originResponseStatus
           clientCountryName
           clientRequestHTTPHost
+          wafAttackScoreClass
+          botManagementDecision
+          verifiedBotCategory
         }
       }
     }
@@ -67,10 +77,13 @@ type errorMetricsResponse struct {
 					EdgeResponseBytes float64 `json:"edgeResponseBytes"`
 				} `json:"sum"`
 				Dimensions struct {
-					EdgeResponseStatus   int    `json:"edgeResponseStatus"`
-					OriginResponseStatus int    `json:"originResponseStatus"`
-					ClientCountryName    string `json:"clientCountryName"`
-					ClientRequestHost    string `json:"clientRequestHTTPHost"`
+					EdgeResponseStatus    int    `json:"edgeResponseStatus"`
+					OriginResponseStatus  int    `json:"originResponseStatus"`
+					ClientCountryName     string `json:"clientCountryName"`
+					ClientRequestHost     string `json:"clientRequestHTTPHost"`
+					WAFAttackScoreClass   string `json:"wafAttackScoreClass"`
+					BotManagementDecision string `json:"botManagementDecision"`
+					VerifiedBotCategory   string `json:"verifiedBotCategory"`
 				} `json:"dimensions"`
 			} `json:"httpRequestsAdaptiveGroups"`
 		} `json:"zones"`
@@ -82,15 +95,18 @@ type errorMetricsResponse struct {
 // origin was never contacted for that row. Count, EdgeRequestBytes, and
 // EdgeResponseBytes are sampling-corrected estimates, not raw sampled sums.
 type ErrorGroup struct {
-	ZoneTag             string
-	EdgeStatus          int
-	OriginStatus        int
-	Country             string
-	Host                string
-	Count               float64
-	AvgOriginDurationMs float64
-	EdgeRequestBytes    float64
-	EdgeResponseBytes   float64
+	ZoneTag               string
+	EdgeStatus            int
+	OriginStatus          int
+	Country               string
+	Host                  string
+	Count                 float64
+	AvgOriginDurationMs   float64
+	EdgeRequestBytes      float64
+	EdgeResponseBytes     float64
+	WAFAttackScoreClass   string
+	BotManagementDecision string
+	VerifiedBotCategory   string
 }
 
 // FetchErrorMetrics fetches per-request error/latency analytics for zoneIDs in
@@ -117,15 +133,18 @@ func (c *Client) FetchErrorMetrics(ctx context.Context, zoneIDs []string, mintim
 	for _, z := range resp.Viewer.Zones {
 		for _, g := range z.HTTPRequestsAdaptiveRows {
 			out = append(out, ErrorGroup{
-				ZoneTag:             z.ZoneTag,
-				EdgeStatus:          g.Dimensions.EdgeResponseStatus,
-				OriginStatus:        g.Dimensions.OriginResponseStatus,
-				Country:             g.Dimensions.ClientCountryName,
-				Host:                g.Dimensions.ClientRequestHost,
-				Count:               estimatedCount(g.Count, g.Avg.SampleInterval),
-				AvgOriginDurationMs: g.Avg.OriginResponseDurationMs,
-				EdgeRequestBytes:    estimatedCount(g.Sum.EdgeRequestBytes, g.Avg.SampleInterval),
-				EdgeResponseBytes:   estimatedCount(g.Sum.EdgeResponseBytes, g.Avg.SampleInterval),
+				ZoneTag:               z.ZoneTag,
+				EdgeStatus:            g.Dimensions.EdgeResponseStatus,
+				OriginStatus:          g.Dimensions.OriginResponseStatus,
+				Country:               g.Dimensions.ClientCountryName,
+				Host:                  g.Dimensions.ClientRequestHost,
+				Count:                 estimatedCount(g.Count, g.Avg.SampleInterval),
+				AvgOriginDurationMs:   g.Avg.OriginResponseDurationMs,
+				EdgeRequestBytes:      estimatedCount(g.Sum.EdgeRequestBytes, g.Avg.SampleInterval),
+				EdgeResponseBytes:     estimatedCount(g.Sum.EdgeResponseBytes, g.Avg.SampleInterval),
+				WAFAttackScoreClass:   g.Dimensions.WAFAttackScoreClass,
+				BotManagementDecision: g.Dimensions.BotManagementDecision,
+				VerifiedBotCategory:   g.Dimensions.VerifiedBotCategory,
 			})
 		}
 	}

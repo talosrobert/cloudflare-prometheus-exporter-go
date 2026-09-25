@@ -125,6 +125,8 @@ type Collector struct {
 	errorTruncatedDesc         *prometheus.Desc
 	requestsHostDesc           *prometheus.Desc
 	bandwidthHostDesc          *prometheus.Desc
+	wafAttackScoreClassDesc    *prometheus.Desc
+	botManagementDesc          *prometheus.Desc
 }
 
 // New builds a Collector for the given discovery jobs.
@@ -196,6 +198,8 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 		errorTruncatedDesc:         desc("zone_error_result_truncated", "1 if the zone's error/latency analytics result hit the query limit, meaning error metrics are undercounted", zoneLabels),
 		requestsHostDesc:           desc("zone_requests_host", windowHelp("Requests by host/subdomain — sampling-corrected estimate from httpRequestsAdaptiveGroups, unlike the exact zone_requests; high cardinality, one series per distinct host seen in the window"), withLabel(zoneLabels, "host")),
 		bandwidthHostDesc:          desc("zone_bandwidth_host_bytes", windowHelp("Bandwidth by host/subdomain — sampling-corrected estimate from httpRequestsAdaptiveGroups, unlike the exact zone_bandwidth_bytes; high cardinality, one series per distinct host seen in the window"), withLabel(zoneLabels, "host")),
+		wafAttackScoreClassDesc:    desc("zone_waf_attack_score_class", windowHelp("Requests by Cloudflare's WAF attack score classification (clean, likely_clean, likely_attack, attack)"), withLabel(zoneLabels, "class")),
+		botManagementDesc:          desc("zone_bot_management_decision", windowHelp("Requests by Bot Management decision (likely_human, automated, likely_automated, verified_bot, other), plus the verified bot category when known"), withLabel(zoneLabels, "decision", "bot_category")),
 	}
 }
 
@@ -220,7 +224,7 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 		c.dnsQueriesDesc, c.dnsQueriesTypeDesc, c.dnsQueriesResponseCodeDesc, c.dnsTruncatedDesc, c.dnsUnmatchedDesc,
 		c.wafEventsDesc, c.wafEventsActionDesc, c.wafEventsSourceDesc, c.wafEventsRuleDesc, c.wafEventsCountryDesc, c.wafTruncatedDesc,
 		c.customerErrorDesc, c.errorRatioDesc, c.originResponseDurationDesc, c.errorTruncatedDesc,
-		c.requestsHostDesc, c.bandwidthHostDesc,
+		c.requestsHostDesc, c.bandwidthHostDesc, c.wafAttackScoreClassDesc, c.botManagementDesc,
 	}
 }
 
@@ -473,10 +477,10 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 func (c *Collector) emitWAFMetrics(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, groups []cloudflareapi.WAFEventGroup, queryLimit int) {
 	totals := make(map[string]float64)
 	rowCount := make(map[string]int)
-	byAction := make(map[dnsZoneKey]float64)
-	bySource := make(map[dnsZoneKey]float64)
-	byRule := make(map[dnsZoneKey]float64)
-	byCountry := make(map[dnsZoneKey]float64)
+	byAction := make(map[zoneLabelKey]float64)
+	bySource := make(map[zoneLabelKey]float64)
+	byRule := make(map[zoneLabelKey]float64)
+	byCountry := make(map[zoneLabelKey]float64)
 
 	for _, g := range groups {
 		if _, inScope := zoneByID[g.ZoneTag]; !inScope {
@@ -484,10 +488,10 @@ func (c *Collector) emitWAFMetrics(ch chan<- prometheus.Metric, zoneByID map[str
 		}
 		totals[g.ZoneTag] += g.Count
 		rowCount[g.ZoneTag]++
-		byAction[dnsZoneKey{g.ZoneTag, g.Action}] += g.Count
-		bySource[dnsZoneKey{g.ZoneTag, g.Source}] += g.Count
-		byRule[dnsZoneKey{g.ZoneTag, g.RuleID}] += g.Count
-		byCountry[dnsZoneKey{g.ZoneTag, g.Country}] += g.Count
+		byAction[zoneLabelKey{g.ZoneTag, g.Action}] += g.Count
+		bySource[zoneLabelKey{g.ZoneTag, g.Source}] += g.Count
+		byRule[zoneLabelKey{g.ZoneTag, g.RuleID}] += g.Count
+		byCountry[zoneLabelKey{g.ZoneTag, g.Country}] += g.Count
 	}
 
 	for zoneID, zone := range zoneByID {
@@ -499,34 +503,20 @@ func (c *Collector) emitWAFMetrics(ch chan<- prometheus.Metric, zoneByID map[str
 		}
 		ch <- prometheus.MustNewConstMetric(c.wafTruncatedDesc, prometheus.GaugeValue, truncated, zone.ID, zone.Name)
 	}
-	for zoneID, total := range totals {
-		zone := zoneByID[zoneID]
-		ch <- prometheus.MustNewConstMetric(c.wafEventsDesc, prometheus.GaugeValue, total, zone.ID, zone.Name)
-	}
-	for key, count := range byAction {
-		zone := zoneByID[key.zoneID]
-		ch <- prometheus.MustNewConstMetric(c.wafEventsActionDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
-	}
-	for key, count := range bySource {
-		zone := zoneByID[key.zoneID]
-		ch <- prometheus.MustNewConstMetric(c.wafEventsSourceDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
-	}
-	for key, count := range byRule {
-		zone := zoneByID[key.zoneID]
-		ch <- prometheus.MustNewConstMetric(c.wafEventsRuleDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
-	}
-	for key, count := range byCountry {
-		zone := zoneByID[key.zoneID]
-		ch <- prometheus.MustNewConstMetric(c.wafEventsCountryDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
-	}
+	emitByZone(ch, zoneByID, c.wafEventsDesc, totals)
+	emitByLabel(ch, zoneByID, c.wafEventsActionDesc, byAction)
+	emitByLabel(ch, zoneByID, c.wafEventsSourceDesc, bySource)
+	emitByLabel(ch, zoneByID, c.wafEventsRuleDesc, byRule)
+	emitByLabel(ch, zoneByID, c.wafEventsCountryDesc, byCountry)
 }
 
 // customerErrorKey groups a customer-facing (edge) error count by zone,
 // status, country, and host.
 type customerErrorKey struct{ zoneID, status, country, host string }
 
-// hostKey groups a per-host aggregate by zone and host.
-type hostKey struct{ zoneID, host string }
+// botKey groups a per-Bot-Management-decision aggregate by zone, decision,
+// and verified bot category.
+type botKey struct{ zoneID, decision, botCategory string }
 
 // emitErrorMetrics aggregates httpRequestsAdaptiveGroups rows by zone.
 // originResponseStatus is 0 for rows the origin was never contacted for, so
@@ -541,8 +531,10 @@ func (c *Collector) emitErrorMetrics(ch chan<- prometheus.Metric, zoneByID map[s
 	originErrors := make(map[string]float64)
 	durationWeightedSum := make(map[string]float64)
 	durationWeightedCount := make(map[string]float64)
-	hostRequests := make(map[hostKey]float64)
-	hostBytes := make(map[hostKey]float64)
+	hostRequests := make(map[zoneLabelKey]float64)
+	hostBytes := make(map[zoneLabelKey]float64)
+	wafClassCounts := make(map[zoneLabelKey]float64)
+	botCounts := make(map[botKey]float64)
 
 	for _, g := range groups {
 		zoneID := g.ZoneTag
@@ -555,9 +547,12 @@ func (c *Collector) emitErrorMetrics(ch chan<- prometheus.Metric, zoneByID map[s
 			customerErrors[customerErrorKey{zoneID, strconv.Itoa(g.EdgeStatus), g.Country, g.Host}] += g.Count
 		}
 
-		hk := hostKey{zoneID, g.Host}
+		hk := zoneLabelKey{zoneID, g.Host}
 		hostRequests[hk] += g.Count
 		hostBytes[hk] += g.EdgeResponseBytes
+
+		wafClassCounts[zoneLabelKey{zoneID, g.WAFAttackScoreClass}] += g.Count
+		botCounts[botKey{zoneID, g.BotManagementDecision, g.VerifiedBotCategory}] += g.Count
 
 		if g.OriginStatus > 0 {
 			originTotal[zoneID] += g.Count
@@ -592,24 +587,40 @@ func (c *Collector) emitErrorMetrics(ch chan<- prometheus.Metric, zoneByID map[s
 		ch <- prometheus.MustNewConstMetric(c.customerErrorDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.status, key.country, key.host)
 	}
 
-	for key, count := range hostRequests {
+	emitByLabel(ch, zoneByID, c.requestsHostDesc, hostRequests)
+	emitByLabel(ch, zoneByID, c.bandwidthHostDesc, hostBytes)
+	emitByLabel(ch, zoneByID, c.wafAttackScoreClassDesc, wafClassCounts)
+	for key, count := range botCounts {
 		zone := zoneByID[key.zoneID]
-		ch <- prometheus.MustNewConstMetric(c.requestsHostDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.host)
-	}
-	for key, bytes := range hostBytes {
-		zone := zoneByID[key.zoneID]
-		ch <- prometheus.MustNewConstMetric(c.bandwidthHostDesc, prometheus.GaugeValue, bytes, zone.ID, zone.Name, key.host)
+		ch <- prometheus.MustNewConstMetric(c.botManagementDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.decision, key.botCategory)
 	}
 }
 
-type dnsZoneKey struct{ zoneID, label string }
+// zoneLabelKey groups a per-zone aggregate by one extra label value.
+type zoneLabelKey struct{ zoneID, label string }
+
+// emitByZone emits one gauge per zone in m.
+func emitByZone(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, desc *prometheus.Desc, m map[string]float64) {
+	for zoneID, v := range m {
+		zone := zoneByID[zoneID]
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, zone.ID, zone.Name)
+	}
+}
+
+// emitByLabel emits one gauge per (zone, label) entry in m.
+func emitByLabel(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, desc *prometheus.Desc, m map[zoneLabelKey]float64) {
+	for key, v := range m {
+		zone := zoneByID[key.zoneID]
+		ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, v, zone.ID, zone.Name, key.label)
+	}
+}
 
 // emitDNSMetrics aggregates DNS rows per in-scope zone and returns the rows
 // whose zone is not in zoneByID so the caller can account for them.
 func (c *Collector) emitDNSMetrics(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, groups []cloudflareapi.DNSQueryGroup) []cloudflareapi.DNSQueryGroup {
 	totals := make(map[string]float64)
-	byType := make(map[dnsZoneKey]float64)
-	byResponseCode := make(map[dnsZoneKey]float64)
+	byType := make(map[zoneLabelKey]float64)
+	byResponseCode := make(map[zoneLabelKey]float64)
 
 	var unmatched []cloudflareapi.DNSQueryGroup
 	for _, g := range groups {
@@ -618,22 +629,13 @@ func (c *Collector) emitDNSMetrics(ch chan<- prometheus.Metric, zoneByID map[str
 			continue
 		}
 		totals[g.ZoneTag] += g.Count
-		byType[dnsZoneKey{g.ZoneTag, g.QueryType}] += g.Count
-		byResponseCode[dnsZoneKey{g.ZoneTag, g.ResponseCode}] += g.Count
+		byType[zoneLabelKey{g.ZoneTag, g.QueryType}] += g.Count
+		byResponseCode[zoneLabelKey{g.ZoneTag, g.ResponseCode}] += g.Count
 	}
 
-	for zoneID, total := range totals {
-		zone := zoneByID[zoneID]
-		ch <- prometheus.MustNewConstMetric(c.dnsQueriesDesc, prometheus.GaugeValue, total, zone.ID, zone.Name)
-	}
-	for key, count := range byType {
-		zone := zoneByID[key.zoneID]
-		ch <- prometheus.MustNewConstMetric(c.dnsQueriesTypeDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
-	}
-	for key, count := range byResponseCode {
-		zone := zoneByID[key.zoneID]
-		ch <- prometheus.MustNewConstMetric(c.dnsQueriesResponseCodeDesc, prometheus.GaugeValue, count, zone.ID, zone.Name, key.label)
-	}
+	emitByZone(ch, zoneByID, c.dnsQueriesDesc, totals)
+	emitByLabel(ch, zoneByID, c.dnsQueriesTypeDesc, byType)
+	emitByLabel(ch, zoneByID, c.dnsQueriesResponseCodeDesc, byResponseCode)
 	return unmatched
 }
 
