@@ -18,6 +18,11 @@ import (
 // (edge cache hit, edge block, redirect, ...), not a successful status; those
 // rows must be excluded from origin-side aggregates or they'd dilute the
 // origin error ratio and duration average with non-origin traffic.
+//
+// sum.edgeRequestBytes/edgeResponseBytes ride along on this same query (no
+// extra API call) to back the by-host request/bandwidth metrics — this is the
+// only dataset with a host dimension at all, since httpRequests1mGroups has
+// none.
 const errorMetricsQuery = `
 query ErrorMetrics($zoneIDs: [string!], $mintime: Time!, $maxtime: Time!, $limit: uint64!) {
   viewer {
@@ -31,6 +36,10 @@ query ErrorMetrics($zoneIDs: [string!], $mintime: Time!, $maxtime: Time!, $limit
         avg {
           originResponseDurationMs
           sampleInterval
+        }
+        sum {
+          edgeRequestBytes
+          edgeResponseBytes
         }
         dimensions {
           edgeResponseStatus
@@ -53,6 +62,10 @@ type errorMetricsResponse struct {
 					OriginResponseDurationMs float64 `json:"originResponseDurationMs"`
 					SampleInterval           float64 `json:"sampleInterval"`
 				} `json:"avg"`
+				Sum struct {
+					EdgeRequestBytes  float64 `json:"edgeRequestBytes"`
+					EdgeResponseBytes float64 `json:"edgeResponseBytes"`
+				} `json:"sum"`
 				Dimensions struct {
 					EdgeResponseStatus   int    `json:"edgeResponseStatus"`
 					OriginResponseStatus int    `json:"originResponseStatus"`
@@ -66,8 +79,8 @@ type errorMetricsResponse struct {
 
 // ErrorGroup is one (zone, edge status, origin status, country, host) bucket
 // of request volume for the requested window. OriginStatus is 0 when the
-// origin was never contacted for that row. Count is the sampling-corrected
-// estimate of real requests, not the raw number of sampled records.
+// origin was never contacted for that row. Count, EdgeRequestBytes, and
+// EdgeResponseBytes are sampling-corrected estimates, not raw sampled sums.
 type ErrorGroup struct {
 	ZoneTag             string
 	EdgeStatus          int
@@ -76,6 +89,8 @@ type ErrorGroup struct {
 	Host                string
 	Count               float64
 	AvgOriginDurationMs float64
+	EdgeRequestBytes    float64
+	EdgeResponseBytes   float64
 }
 
 // FetchErrorMetrics fetches per-request error/latency analytics for zoneIDs in
@@ -109,6 +124,8 @@ func (c *Client) FetchErrorMetrics(ctx context.Context, zoneIDs []string, mintim
 				Host:                g.Dimensions.ClientRequestHost,
 				Count:               estimatedCount(g.Count, g.Avg.SampleInterval),
 				AvgOriginDurationMs: g.Avg.OriginResponseDurationMs,
+				EdgeRequestBytes:    estimatedCount(g.Sum.EdgeRequestBytes, g.Avg.SampleInterval),
+				EdgeResponseBytes:   estimatedCount(g.Sum.EdgeResponseBytes, g.Avg.SampleInterval),
 			})
 		}
 	}

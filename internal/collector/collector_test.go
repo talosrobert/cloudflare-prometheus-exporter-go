@@ -165,14 +165,14 @@ func newFake() *fakeClient {
 		},
 		errorGroups: []cloudflareapi.ErrorGroup{
 			// edge and origin both error.
-			{ZoneTag: "zone-prod", EdgeStatus: 500, OriginStatus: 500, Country: "US", Host: "prod.example.com", Count: 3, AvgOriginDurationMs: 120},
+			{ZoneTag: "zone-prod", EdgeStatus: 500, OriginStatus: 500, Country: "US", Host: "prod.example.com", Count: 3, AvgOriginDurationMs: 120, EdgeResponseBytes: 300},
 			// edge served from cache (200) but the origin itself errored.
-			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 502, Country: "DE", Host: "prod.example.com", Count: 2, AvgOriginDurationMs: 80},
+			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 502, Country: "DE", Host: "prod.example.com", Count: 2, AvgOriginDurationMs: 80, EdgeResponseBytes: 200},
 			// edge-blocked request, origin never contacted: OriginStatus 0 and
 			// AvgOriginDurationMs -1 must be excluded from origin aggregates.
-			{ZoneTag: "zone-prod", EdgeStatus: 403, OriginStatus: 0, Country: "FR", Host: "prod.example.com", Count: 5, AvgOriginDurationMs: -1},
+			{ZoneTag: "zone-prod", EdgeStatus: 403, OriginStatus: 0, Country: "FR", Host: "prod.example.com", Count: 5, AvgOriginDurationMs: -1, EdgeResponseBytes: 500},
 			// fully healthy request.
-			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 200, Country: "US", Host: "prod.example.com", Count: 10, AvgOriginDurationMs: 50},
+			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 200, Country: "US", Host: "prod.example.com", Count: 10, AvgOriginDurationMs: 50, EdgeResponseBytes: 1000},
 		},
 	}
 }
@@ -792,41 +792,36 @@ func TestCollector_CustomerErrorMetrics(t *testing.T) {
 	}
 }
 
-// -exclude-host must drop the host label and merge counts from different
-// hosts into one series instead of producing duplicate label sets (which
-// would fail the whole scrape on a pedantic registry).
-func TestCollector_CustomerErrorExcludeHost(t *testing.T) {
+// cloudflare_zone_requests_host and cloudflare_zone_bandwidth_host_bytes sum
+// every row for a host regardless of status — unlike customer_error, which
+// only counts edge 4xx/5xx rows.
+func TestCollector_RequestsAndBandwidthByHost(t *testing.T) {
 	fc := newFake()
 	fc.errorGroups = append(fc.errorGroups,
-		cloudflareapi.ErrorGroup{ZoneTag: "zone-prod", EdgeStatus: 500, OriginStatus: 500, Country: "US", Host: "other.example.com", Count: 4, AvgOriginDurationMs: 10},
+		cloudflareapi.ErrorGroup{ZoneTag: "zone-prod", EdgeStatus: 500, OriginStatus: 500, Country: "DE", Host: "other.example.com", Count: 4, AvgOriginDurationMs: 10, EdgeResponseBytes: 400},
 	)
-	opts := testOptions()
-	opts.ExcludeHost = true
-	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
 
-	out := gather(t, c) // pedantic Gather() would fail here if host-dropping produced duplicate series.
+	out := gather(t, c)
 
-	mf := findFamily(out, "cloudflare_zone_requests_customer_error")
-	if mf == nil {
-		t.Fatal("expected a customer_error family")
+	// prod.example.com rows: counts 3, 2, 5, 10 -> 20; bytes 300+200+500+1000=2000.
+	if got, ok := metricValue(out, "cloudflare_zone_requests_host", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "host": "prod.example.com",
+	}); !ok || got != 20 {
+		t.Errorf("requests_host{prod.example.com} = %v, ok=%v, want 20", got, ok)
 	}
-	for _, m := range mf.GetMetric() {
-		for _, l := range m.GetLabel() {
-			if l.GetName() == "host" {
-				t.Errorf("host label must be absent when ExcludeHost is set, got %+v", m)
-			}
-		}
+	if got, ok := metricValue(out, "cloudflare_zone_bandwidth_host_bytes", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "host": "prod.example.com",
+	}); !ok || got != 2000 {
+		t.Errorf("bandwidth_host_bytes{prod.example.com} = %v, ok=%v, want 2000", got, ok)
 	}
-	// The two 500/US rows (counts 3 and 4, originally different hosts) must
-	// merge into a single count-7 series once the host label is dropped.
-	got, ok := metricValue(out, "cloudflare_zone_requests_customer_error", map[string]string{
-		"zone": "prod.example.com", "zone_id": "zone-prod", "status": "500", "country": "US",
-	})
-	if !ok {
-		t.Fatal("expected a merged 500/US customer_error series")
-	}
-	if want := 7.0; got != want {
-		t.Errorf("merged customer_error{status=500,country=US} = %v, want %v", got, want)
+
+	// other.example.com: single row, count 4, bytes 400 — not folded into
+	// prod.example.com's series.
+	if got, ok := metricValue(out, "cloudflare_zone_requests_host", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "host": "other.example.com",
+	}); !ok || got != 4 {
+		t.Errorf("requests_host{other.example.com} = %v, ok=%v, want 4", got, ok)
 	}
 }
 

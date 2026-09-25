@@ -152,8 +152,8 @@ func TestClient_FetchErrorMetrics(t *testing.T) {
 			t.Error("expected error-metrics query body")
 		}
 		_, _ = w.Write([]byte(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","httpRequestsAdaptiveGroups":[
-			{"count":3,"avg":{"originResponseDurationMs":120,"sampleInterval":1},"dimensions":{"edgeResponseStatus":500,"originResponseStatus":500,"clientCountryName":"US","clientRequestHTTPHost":"example.com"}},
-			{"count":5,"avg":{"originResponseDurationMs":-1,"sampleInterval":10},"dimensions":{"edgeResponseStatus":403,"originResponseStatus":0,"clientCountryName":"FR","clientRequestHTTPHost":"example.com"}}
+			{"count":3,"avg":{"originResponseDurationMs":120,"sampleInterval":1},"sum":{"edgeRequestBytes":150,"edgeResponseBytes":900},"dimensions":{"edgeResponseStatus":500,"originResponseStatus":500,"clientCountryName":"US","clientRequestHTTPHost":"example.com"}},
+			{"count":5,"avg":{"originResponseDurationMs":-1,"sampleInterval":10},"sum":{"edgeRequestBytes":50,"edgeResponseBytes":200},"dimensions":{"edgeResponseStatus":403,"originResponseStatus":0,"clientCountryName":"FR","clientRequestHTTPHost":"example.com"}}
 		]}]}}}`))
 	})
 
@@ -167,11 +167,17 @@ func TestClient_FetchErrorMetrics(t *testing.T) {
 	if got[0].Count != 3 || got[0].EdgeStatus != 500 || got[0].OriginStatus != 500 || got[0].Country != "US" || got[0].Host != "example.com" || got[0].AvgOriginDurationMs != 120 {
 		t.Errorf("unexpected first group: %+v", got[0])
 	}
+	if got[0].EdgeRequestBytes != 150 || got[0].EdgeResponseBytes != 900 {
+		t.Errorf("unsampled group bytes = %+v, want EdgeRequestBytes=150 EdgeResponseBytes=900 (sampleInterval 1)", got[0])
+	}
 	if got[1].OriginStatus != 0 || got[1].AvgOriginDurationMs != -1 {
 		t.Errorf("unexpected second group (origin not contacted): %+v", got[1])
 	}
 	if got[1].Count != 50 {
 		t.Errorf("sampled group Count = %v, want 50 (5 records × sampleInterval 10)", got[1].Count)
+	}
+	if got[1].EdgeRequestBytes != 500 || got[1].EdgeResponseBytes != 2000 {
+		t.Errorf("sampled group bytes = %+v, want EdgeRequestBytes=500 EdgeResponseBytes=2000 (raw × sampleInterval 10)", got[1])
 	}
 }
 
