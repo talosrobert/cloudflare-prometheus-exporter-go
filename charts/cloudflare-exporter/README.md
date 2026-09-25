@@ -32,7 +32,6 @@ first — the chart does not build or push images itself.
 | `exporter.queryLimit` | `10000` | `-query-limit` |
 | `exporter.metricsPath` | `/metrics` | Written into `config.yaml`'s `server.metricsPath`. |
 | `exporter.scrapeTimeout` | `30s` | Written into `config.yaml`'s `server.scrapeTimeout`. |
-| `exporter.excludeHost` | `false` | `-exclude-host` — drops the high-cardinality `host` label from `cloudflare_zone_requests_customer_error`. |
 | `exporter.discovery.jobs` | one `production-zones` job, `env=production` | Rendered verbatim into `config.yaml`'s `discovery.jobs` — see the main [README](../../README.md#configuration) for the `searchTags`/`accounts` shape. |
 | `service.type` | `ClusterIP` | |
 | `service.port` | `9199` | Also the container port and `config.yaml`'s `listenAddress`. |
