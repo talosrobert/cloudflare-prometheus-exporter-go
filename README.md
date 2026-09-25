@@ -118,6 +118,8 @@ Labels on every zone metric: `zone_id`, `zone`.
 | `cloudflare_zone_requests_customer_error` | `status`, `country`, `host` | Requests with an edge 4xx/5xx response — **high cardinality**, one series per distinct (status, country, host) combination seen in the window |
 | `cloudflare_zone_requests_host` | `host` | Requests by host/subdomain — **sampled estimate** from `httpRequestsAdaptiveGroups` (unlike the exact `cloudflare_zone_requests`), **high cardinality**, one series per distinct host seen in the window |
 | `cloudflare_zone_bandwidth_host_bytes` | `host` | Bandwidth by host/subdomain — **sampled estimate** (unlike the exact `cloudflare_zone_bandwidth_bytes`), **high cardinality** |
+| `cloudflare_zone_waf_attack_score_class` | `class` | Requests by Cloudflare's WAF attack score classification (`clean`, `likely_clean`, `likely_attack`, `attack`) — sampled estimate |
+| `cloudflare_zone_bot_management_decision` | `decision`, `bot_category` | Requests by Bot Management decision (`likely_human`, `automated`, `likely_automated`, `verified_bot`, `other`), plus the verified bot category when known (e.g. `Search Engine Crawler`) — sampled estimate |
 | `cloudflare_zone_error_ratio` | `side` | 4xx/5xx error ratio, by side: `edge` (edge 4xx/5xx responses / total requests) or `origin` (origin 4xx/5xx responses / requests that reached the origin, excludes edge cache hits, edge blocks, and anything else never sent to the origin) |
 | `cloudflare_zone_origin_response_duration_seconds` | | Average origin response duration, weighted by request count, across requests that reached the origin |
 | `cloudflare_zone_error_result_truncated` | (zone labels) | 1 if that zone's error/latency analytics result hit `-query-limit` in this scrape |

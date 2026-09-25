@@ -165,14 +165,14 @@ func newFake() *fakeClient {
 		},
 		errorGroups: []cloudflareapi.ErrorGroup{
 			// edge and origin both error.
-			{ZoneTag: "zone-prod", EdgeStatus: 500, OriginStatus: 500, Country: "US", Host: "prod.example.com", Count: 3, AvgOriginDurationMs: 120, EdgeResponseBytes: 300},
+			{ZoneTag: "zone-prod", EdgeStatus: 500, OriginStatus: 500, Country: "US", Host: "prod.example.com", Count: 3, AvgOriginDurationMs: 120, EdgeResponseBytes: 300, WAFAttackScoreClass: "attack", BotManagementDecision: "automated"},
 			// edge served from cache (200) but the origin itself errored.
-			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 502, Country: "DE", Host: "prod.example.com", Count: 2, AvgOriginDurationMs: 80, EdgeResponseBytes: 200},
+			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 502, Country: "DE", Host: "prod.example.com", Count: 2, AvgOriginDurationMs: 80, EdgeResponseBytes: 200, WAFAttackScoreClass: "clean", BotManagementDecision: "likely_human"},
 			// edge-blocked request, origin never contacted: OriginStatus 0 and
 			// AvgOriginDurationMs -1 must be excluded from origin aggregates.
-			{ZoneTag: "zone-prod", EdgeStatus: 403, OriginStatus: 0, Country: "FR", Host: "prod.example.com", Count: 5, AvgOriginDurationMs: -1, EdgeResponseBytes: 500},
-			// fully healthy request.
-			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 200, Country: "US", Host: "prod.example.com", Count: 10, AvgOriginDurationMs: 50, EdgeResponseBytes: 1000},
+			{ZoneTag: "zone-prod", EdgeStatus: 403, OriginStatus: 0, Country: "FR", Host: "prod.example.com", Count: 5, AvgOriginDurationMs: -1, EdgeResponseBytes: 500, WAFAttackScoreClass: "attack", BotManagementDecision: "automated"},
+			// fully healthy request, from a verified bot.
+			{ZoneTag: "zone-prod", EdgeStatus: 200, OriginStatus: 200, Country: "US", Host: "prod.example.com", Count: 10, AvgOriginDurationMs: 50, EdgeResponseBytes: 1000, WAFAttackScoreClass: "clean", BotManagementDecision: "verified_bot", VerifiedBotCategory: "Search Engine Crawler"},
 		},
 	}
 }
@@ -822,6 +822,40 @@ func TestCollector_RequestsAndBandwidthByHost(t *testing.T) {
 		"zone": "prod.example.com", "zone_id": "zone-prod", "host": "other.example.com",
 	}); !ok || got != 4 {
 		t.Errorf("requests_host{other.example.com} = %v, ok=%v, want 4", got, ok)
+	}
+}
+
+// cloudflare_zone_waf_attack_score_class and cloudflare_zone_bot_management_decision
+// sum every row by their respective classification, regardless of status.
+func TestCollector_WAFAttackScoreAndBotManagement(t *testing.T) {
+	c := New(newFake(), []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+
+	// "attack" rows: counts 3 (500/US) + 5 (403/FR) = 8; "clean" rows: 2 + 10 = 12.
+	if got, ok := metricValue(out, "cloudflare_zone_waf_attack_score_class", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "class": "attack",
+	}); !ok || got != 8 {
+		t.Errorf("waf_attack_score_class{attack} = %v, ok=%v, want 8", got, ok)
+	}
+	if got, ok := metricValue(out, "cloudflare_zone_waf_attack_score_class", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "class": "clean",
+	}); !ok || got != 12 {
+		t.Errorf("waf_attack_score_class{clean} = %v, ok=%v, want 12", got, ok)
+	}
+
+	// "automated" rows: counts 3 + 5 = 8, no bot category.
+	if got, ok := metricValue(out, "cloudflare_zone_bot_management_decision", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "decision": "automated", "bot_category": "",
+	}); !ok || got != 8 {
+		t.Errorf("bot_management_decision{automated} = %v, ok=%v, want 8", got, ok)
+	}
+	// verified_bot row (count 10) carries its bot category as a separate series
+	// from a plain verified_bot with no category.
+	if got, ok := metricValue(out, "cloudflare_zone_bot_management_decision", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "decision": "verified_bot", "bot_category": "Search Engine Crawler",
+	}); !ok || got != 10 {
+		t.Errorf("bot_management_decision{verified_bot,Search Engine Crawler} = %v, ok=%v, want 10", got, ok)
 	}
 }
 
