@@ -660,16 +660,42 @@ func (c *Collector) emitZoneMetrics(ch chan<- prometheus.Metric, zone cloudflare
 		gauge(c.cacheHitRatioDesc, sum.CachedRequests/sum.Requests)
 	}
 
+	// Every sum.*Map below is summed per label value before being emitted:
+	// Cloudflare groups these arrays by a raw dimension but reports a coarser
+	// name, so one response can carry the same name twice (application/javascript
+	// and text/javascript both report as edgeResponseContentTypeName "js").
+	// Emitting both rows would make the registry reject the whole scrape as a
+	// duplicate series, losing every metric for the zone.
+	contentTypeRequests := make(map[string]float64, len(sum.ContentTypeMap))
+	contentTypeBytes := make(map[string]float64, len(sum.ContentTypeMap))
 	for _, ct := range sum.ContentTypeMap {
-		gauge(c.requestsContentTypeDesc, ct.Requests, ct.EdgeResponseContentTypeName)
-		gauge(c.bandwidthContentTypeDesc, ct.Bytes, ct.EdgeResponseContentTypeName)
+		contentTypeRequests[ct.EdgeResponseContentTypeName] += ct.Requests
+		contentTypeBytes[ct.EdgeResponseContentTypeName] += ct.Bytes
+	}
+	for name, requests := range contentTypeRequests {
+		gauge(c.requestsContentTypeDesc, requests, name)
+	}
+	for name, bytes := range contentTypeBytes {
+		gauge(c.bandwidthContentTypeDesc, bytes, name)
 	}
 
+	countryRequests := make(map[string]float64, len(sum.CountryMap))
+	countryBytes := make(map[string]float64, len(sum.CountryMap))
+	countryThreats := make(map[string]float64, len(sum.CountryMap))
 	for _, cn := range sum.CountryMap {
-		gauge(c.requestsCountryDesc, cn.Requests, cn.ClientCountryName)
-		gauge(c.bandwidthCountryDesc, cn.Bytes, cn.ClientCountryName)
-		if cn.Threats > 0 {
-			gauge(c.threatsCountryDesc, cn.Threats, cn.ClientCountryName)
+		countryRequests[cn.ClientCountryName] += cn.Requests
+		countryBytes[cn.ClientCountryName] += cn.Bytes
+		countryThreats[cn.ClientCountryName] += cn.Threats
+	}
+	for name, requests := range countryRequests {
+		gauge(c.requestsCountryDesc, requests, name)
+	}
+	for name, bytes := range countryBytes {
+		gauge(c.bandwidthCountryDesc, bytes, name)
+	}
+	for name, threats := range countryThreats {
+		if threats > 0 {
+			gauge(c.threatsCountryDesc, threats, name)
 		}
 	}
 
@@ -688,29 +714,42 @@ func (c *Collector) emitZoneMetrics(ch chan<- prometheus.Metric, zone cloudflare
 		gauge(c.errorRatioDesc, edgeErrors/sum.Requests, "edge")
 	}
 
+	browserPageViews := make(map[string]float64, len(sum.BrowserMap))
 	for _, b := range sum.BrowserMap {
-		if b.PageViews > 0 {
-			gauge(c.requestsBrowserDesc, b.PageViews, b.UaBrowserFamily)
-		}
+		browserPageViews[b.UaBrowserFamily] += b.PageViews
 	}
+	emitNonZero(gauge, c.requestsBrowserDesc, browserPageViews)
+
+	threatsByType := make(map[string]float64, len(sum.ThreatPathingMap))
 	for _, t := range sum.ThreatPathingMap {
-		if t.Requests > 0 {
-			gauge(c.threatsTypeDesc, t.Requests, t.ThreatPathingName)
-		}
+		threatsByType[t.ThreatPathingName] += t.Requests
 	}
+	emitNonZero(gauge, c.threatsTypeDesc, threatsByType)
+
+	requestsByIPClass := make(map[string]float64, len(sum.IPClassMap))
 	for _, ip := range sum.IPClassMap {
-		if ip.Requests > 0 {
-			gauge(c.requestsIPClassDesc, ip.Requests, ip.IPType)
-		}
+		requestsByIPClass[ip.IPType] += ip.Requests
 	}
+	emitNonZero(gauge, c.requestsIPClassDesc, requestsByIPClass)
+
+	requestsBySSLProtocol := make(map[string]float64, len(sum.ClientSSLMap))
 	for _, ssl := range sum.ClientSSLMap {
-		if ssl.Requests > 0 {
-			gauge(c.requestsSSLProtocolDesc, ssl.Requests, ssl.ClientSSLProtocol)
-		}
+		requestsBySSLProtocol[ssl.ClientSSLProtocol] += ssl.Requests
 	}
+	emitNonZero(gauge, c.requestsSSLProtocolDesc, requestsBySSLProtocol)
+
+	requestsByHTTPVersion := make(map[string]float64, len(sum.ClientHTTPVersionMap))
 	for _, hv := range sum.ClientHTTPVersionMap {
-		if hv.Requests > 0 {
-			gauge(c.requestsHTTPVersionDesc, hv.Requests, hv.ClientHTTPProtocol)
+		requestsByHTTPVersion[hv.ClientHTTPProtocol] += hv.Requests
+	}
+	emitNonZero(gauge, c.requestsHTTPVersionDesc, requestsByHTTPVersion)
+}
+
+// emitNonZero emits one gauge per label value whose sum is above zero.
+func emitNonZero(gauge func(*prometheus.Desc, float64, ...string), d *prometheus.Desc, sums map[string]float64) {
+	for name, v := range sums {
+		if v > 0 {
+			gauge(d, v, name)
 		}
 	}
 }

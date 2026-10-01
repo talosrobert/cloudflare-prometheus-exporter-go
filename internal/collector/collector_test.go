@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"slices"
 	"strings"
 	"testing"
@@ -324,6 +325,71 @@ cloudflare_zone_requests{zone="prod.example.com",zone_id="zone-prod"} 100
 cloudflare_zone_cache_hit_ratio{zone="prod.example.com",zone_id="zone-prod"} 0.25
 `), "cloudflare_zone_requests", "cloudflare_zone_cache_hit_ratio"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Cloudflare groups its sum.*Map arrays by a raw dimension but reports a
+// coarser name, so one response can carry the same name twice — two JavaScript
+// content types both arriving as "js". Reaching gather() proves the scrape
+// survives; the values prove the rows are summed instead of one overwriting
+// the other.
+func TestCollector_RepeatedMapNamesAreSummed(t *testing.T) {
+	fc := newFake()
+	m := fc.metrics["zone-prod"]
+	m.Group.Sum.ContentTypeMap = []struct {
+		Bytes                       float64 `json:"bytes"`
+		Requests                    float64 `json:"requests"`
+		EdgeResponseContentTypeName string  `json:"edgeResponseContentTypeName"`
+	}{
+		{Bytes: 600, Requests: 30, EdgeResponseContentTypeName: "js"},
+		{Bytes: 150, Requests: 12, EdgeResponseContentTypeName: "js"},
+		{Bytes: 90, Requests: 8, EdgeResponseContentTypeName: "css"},
+	}
+	m.Group.Sum.CountryMap = []struct {
+		Bytes             float64 `json:"bytes"`
+		ClientCountryName string  `json:"clientCountryName"`
+		Requests          float64 `json:"requests"`
+		Threats           float64 `json:"threats"`
+	}{
+		{Bytes: 40, ClientCountryName: "AT", Requests: 9, Threats: 1},
+		{Bytes: 60, ClientCountryName: "AT", Requests: 6, Threats: 2},
+	}
+	m.Group.Sum.ClientSSLMap = []struct {
+		ClientSSLProtocol string  `json:"clientSSLProtocol"`
+		Requests          float64 `json:"requests"`
+	}{
+		{ClientSSLProtocol: "TLSv1.3", Requests: 7},
+		{ClientSSLProtocol: "TLSv1.3", Requests: 5},
+	}
+	fc.metrics["zone-prod"] = m
+
+	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+	out := gather(t, c)
+
+	zone := map[string]string{"zone_id": "zone-prod", "zone": "prod.example.com"}
+	for _, tc := range []struct {
+		family string
+		labels map[string]string
+		want   float64
+	}{
+		{"cloudflare_zone_requests_content_type", map[string]string{"content_type": "js"}, 42},
+		{"cloudflare_zone_bandwidth_content_type_bytes", map[string]string{"content_type": "js"}, 750},
+		{"cloudflare_zone_requests_content_type", map[string]string{"content_type": "css"}, 8},
+		{"cloudflare_zone_requests_country", map[string]string{"country": "AT"}, 15},
+		{"cloudflare_zone_bandwidth_country_bytes", map[string]string{"country": "AT"}, 100},
+		{"cloudflare_zone_threats_country", map[string]string{"country": "AT"}, 3},
+		{"cloudflare_zone_requests_ssl_protocol", map[string]string{"ssl_protocol": "TLSv1.3"}, 12},
+	} {
+		want := maps.Clone(zone)
+		maps.Copy(want, tc.labels)
+		got, ok := metricValue(out, tc.family, want)
+		if !ok {
+			t.Errorf("%s%v: series missing", tc.family, tc.labels)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("%s%v = %v, want %v", tc.family, tc.labels, got, tc.want)
+		}
 	}
 }
 
