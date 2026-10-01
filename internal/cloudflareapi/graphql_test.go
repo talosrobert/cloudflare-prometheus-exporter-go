@@ -52,6 +52,56 @@ func TestGraphQLClient_Query(t *testing.T) {
 	}
 }
 
+// httpRequests1mGroups buckets per whole minute, so a window longer than a
+// minute comes back as several buckets. Every bucket has to land in the result
+// or the zone metrics report only the window's first minute.
+func TestClient_FetchHTTPMetricsSumsBuckets(t *testing.T) {
+	c := newTestGraphQL(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","httpRequests1mGroups":[
+			{"uniq":{"uniques":7},"sum":{"requests":40,"bytes":900,"cachedRequests":10,"threats":1,"contentTypeMap":[{"bytes":600,"requests":30,"edgeResponseContentTypeName":"js"}],"responseStatusMap":[{"edgeResponseStatus":200,"requests":40}]},"dimensions":{"datetime":"2026-10-01T10:00:00Z"}},
+			{"uniq":{"uniques":3},"sum":{"requests":12,"bytes":100,"cachedRequests":2,"threats":2,"contentTypeMap":[{"bytes":150,"requests":12,"edgeResponseContentTypeName":"js"}],"responseStatusMap":[{"edgeResponseStatus":500,"requests":12}]},"dimensions":{"datetime":"2026-10-01T10:01:00Z"}}
+		]}]}}}`))
+	})
+
+	now := time.Now()
+	got, err := c.FetchHTTPMetrics(t.Context(), []string{"zone-1"}, now.Add(-2*time.Minute), now, 100)
+	if err != nil {
+		t.Fatalf("FetchHTTPMetrics() error = %v", err)
+	}
+	if len(got) != 1 || !got[0].HasData {
+		t.Fatalf("got %+v, want one zone with data", got)
+	}
+
+	sum := got[0].Group.Sum
+	for _, tc := range []struct {
+		field string
+		got   float64
+		want  float64
+	}{
+		{"requests", sum.Requests, 52},
+		{"bytes", sum.Bytes, 1000},
+		{"cachedRequests", sum.CachedRequests, 12},
+		{"threats", sum.Threats, 3},
+		{"uniques", got[0].Group.Uniq.Uniques, 10},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.field, tc.got, tc.want)
+		}
+	}
+
+	// Breakdown rows stay one per bucket; the collector sums them per label
+	// value, so "js" twice is expected here.
+	if len(sum.ContentTypeMap) != 2 {
+		t.Errorf("contentTypeMap has %d rows, want 2 (one per bucket)", len(sum.ContentTypeMap))
+	}
+	if len(sum.ResponseStatusMap) != 2 {
+		t.Errorf("responseStatusMap has %d rows, want 2 (one per bucket)", len(sum.ResponseStatusMap))
+	}
+	if date := got[0].Group.Dimensions.Datetime; date != "2026-10-01T10:00:00Z" {
+		t.Errorf("datetime = %q, want the earliest bucket's", date)
+	}
+}
+
 func TestGraphQLClient_Errors(t *testing.T) {
 	cases := []struct {
 		name    string
