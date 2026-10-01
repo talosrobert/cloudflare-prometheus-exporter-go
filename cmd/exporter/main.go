@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -124,5 +125,8 @@ func run(logger *slog.Logger) error {
 type slogErrorLogger struct{ logger *slog.Logger }
 
 func (l slogErrorLogger) Println(v ...any) {
-	l.logger.Error("promhttp handler error", "detail", v)
+	// fmt.Sprintln (not a raw slog attr) so error/Stringer operands render via
+	// their Error()/String() method instead of marshaling to "{}" over their
+	// unexported fields.
+	l.logger.Error("promhttp handler error", "detail", strings.TrimSuffix(fmt.Sprintln(v...), "\n"))
 }
