@@ -137,13 +137,55 @@ type httpRequests1mGroup struct {
 	} `json:"dimensions"`
 }
 
-// ZoneHTTPMetrics is the per-zone slice of httpMetricsResponse callers use;
-// it is exactly one httpRequests1mGroups[0] (the exporter always aggregates
-// over a single time window per scrape, matching the original implementation).
+// ZoneHTTPMetrics is the per-zone slice of httpMetricsResponse callers use:
+// every httpRequests1mGroups bucket the window touched, merged into one group
+// by mergeGroup.
 type ZoneHTTPMetrics struct {
 	ZoneTag string
 	Group   httpRequests1mGroup
 	HasData bool
+}
+
+// mergeGroup folds b's counts into a. httpRequests1mGroups buckets per whole
+// minute, so a window longer than a minute spans several buckets and summing
+// them is the only way to report the whole window.
+//
+// The breakdown slices are concatenated instead of summed per key, because the
+// collector already sums every sum.*Map by label value — Cloudflare repeats a
+// name within a single bucket too, when two raw dimensions share one reported
+// name.
+//
+// Uniques is the one non-additive field: a visitor active in two of the
+// window's minutes counts twice, so a multi-minute window reports an upper
+// bound.
+func mergeGroup(a, b httpRequests1mGroup) httpRequests1mGroup {
+	a.Uniq.Uniques += b.Uniq.Uniques
+
+	a.Sum.Bytes += b.Sum.Bytes
+	a.Sum.CachedBytes += b.Sum.CachedBytes
+	a.Sum.CachedRequests += b.Sum.CachedRequests
+	a.Sum.EncryptedBytes += b.Sum.EncryptedBytes
+	a.Sum.EncryptedRequests += b.Sum.EncryptedRequests
+	a.Sum.PageViews += b.Sum.PageViews
+	a.Sum.Requests += b.Sum.Requests
+	a.Sum.Threats += b.Sum.Threats
+
+	a.Sum.BrowserMap = append(a.Sum.BrowserMap, b.Sum.BrowserMap...)
+	a.Sum.ContentTypeMap = append(a.Sum.ContentTypeMap, b.Sum.ContentTypeMap...)
+	a.Sum.CountryMap = append(a.Sum.CountryMap, b.Sum.CountryMap...)
+	a.Sum.ResponseStatusMap = append(a.Sum.ResponseStatusMap, b.Sum.ResponseStatusMap...)
+	a.Sum.ThreatPathingMap = append(a.Sum.ThreatPathingMap, b.Sum.ThreatPathingMap...)
+	a.Sum.ClientHTTPVersionMap = append(a.Sum.ClientHTTPVersionMap, b.Sum.ClientHTTPVersionMap...)
+	a.Sum.ClientSSLMap = append(a.Sum.ClientSSLMap, b.Sum.ClientSSLMap...)
+	a.Sum.IPClassMap = append(a.Sum.IPClassMap, b.Sum.IPClassMap...)
+
+	// A merged group covers several buckets, so keep the earliest bucket's
+	// datetime rather than inventing one.
+	if a.Dimensions.Datetime == "" {
+		a.Dimensions = b.Dimensions
+	}
+
+	return a
 }
 
 // FetchHTTPMetrics fetches one time-window's HTTP analytics for zoneIDs in a
@@ -169,8 +211,8 @@ func (c *Client) FetchHTTPMetrics(ctx context.Context, zoneIDs []string, mintime
 	out := make([]ZoneHTTPMetrics, 0, len(resp.Viewer.Zones))
 	for _, z := range resp.Viewer.Zones {
 		m := ZoneHTTPMetrics{ZoneTag: z.ZoneTag}
-		if len(z.HTTPRequests1mGroups) > 0 {
-			m.Group = z.HTTPRequests1mGroups[0]
+		for _, g := range z.HTTPRequests1mGroups {
+			m.Group = mergeGroup(m.Group, g)
 			m.HasData = true
 		}
 		out = append(out, m)
