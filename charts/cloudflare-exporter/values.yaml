@@ -30,7 +30,14 @@ exporter:
   analyticsLag: 5m
   queryLimit: 10000
   metricsPath: /metrics
-  scrapeTimeout: 30s
+  # Bounds one whole scrape across every job/account/zone combined. Keep the
+  # service annotations and serviceMonitor scrape-timeout/interval below in
+  # sync with this value — Prometheus cuts the connection on its own timeout
+  # before the exporter finishes otherwise.
+  scrapeTimeout: 120s
+  # How many accounts within a job are scraped in parallel; all accounts in a
+  # job share the scrapeTimeout budget above.
+  accountConcurrency: 4
   # Rendered as-is into config.yaml's discovery.jobs; see the main README for
   # the searchTags/accounts shape.
   discovery:
@@ -51,14 +58,14 @@ service:
     # Cloudflare directly, so the scrape interval is the Cloudflare API call
     # rate. Raise these to reduce Cloudflare API pressure/avoid rate-limiting
     # (matches serviceMonitor.interval/.scrapeTimeout's defaults below).
-    prometheus.io/interval: "60s"
-    prometheus.io/scrape-timeout: "30s"
+    prometheus.io/interval: "150s"
+    prometheus.io/scrape-timeout: "120s"
 
 # Requires the Prometheus Operator CRDs.
 serviceMonitor:
   enabled: false
-  interval: 60s
-  scrapeTimeout: 30s
+  interval: 150s
+  scrapeTimeout: 120s
   labels: {}
   annotations: {}
 

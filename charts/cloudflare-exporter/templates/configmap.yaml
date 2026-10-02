@@ -13,3 +13,4 @@ data:
       listenAddress: ":{{ .Values.service.port }}"
       metricsPath: {{ .Values.exporter.metricsPath | quote }}
       scrapeTimeout: {{ .Values.exporter.scrapeTimeout | quote }}
+      accountConcurrency: {{ .Values.exporter.accountConcurrency }}

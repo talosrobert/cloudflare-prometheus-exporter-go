@@ -31,17 +31,18 @@ first — the chart does not build or push images itself.
 | `exporter.analyticsLag` | `5m` | `-analytics-lag` |
 | `exporter.queryLimit` | `10000` | `-query-limit` |
 | `exporter.metricsPath` | `/metrics` | Written into `config.yaml`'s `server.metricsPath`. |
-| `exporter.scrapeTimeout` | `30s` | Written into `config.yaml`'s `server.scrapeTimeout`. |
+| `exporter.scrapeTimeout` | `120s` | Written into `config.yaml`'s `server.scrapeTimeout`. Keep `service.annotations`' `/scrape-timeout` and `serviceMonitor.scrapeTimeout` >= this value. |
+| `exporter.accountConcurrency` | `4` | Written into `config.yaml`'s `server.accountConcurrency` — how many accounts within a job are scraped in parallel. |
 | `exporter.discovery.jobs` | one `production-zones` job, `env=production` | Rendered verbatim into `config.yaml`'s `discovery.jobs` — see the main [README](../../README.md#configuration) for the `searchTags`/`accounts` shape. |
 | `service.type` | `ClusterIP` | |
 | `service.port` | `9199` | Also the container port and `config.yaml`'s `listenAddress`. |
-| `service.annotations` | `prometheus.io/scrape`, `/port`, `/path`, `/interval` (`60s`), `/scrape-timeout` (`30s`) | Set for non-Operator Prometheus discovery. `interval`/`scrape-timeout` are honored only if your scrape config maps them to `__scrape_interval__`/`__scrape_timeout__` — a common but not universal convention. |
+| `service.annotations` | `prometheus.io/scrape`, `/port`, `/path`, `/interval` (`150s`), `/scrape-timeout` (`120s`) | Set for non-Operator Prometheus discovery. `interval`/`scrape-timeout` are honored only if your scrape config maps them to `__scrape_interval__`/`__scrape_timeout__` — a common but not universal convention. |
 | `serviceAccount.create` | `true` | Create a dedicated ServiceAccount for the Deployment. |
 | `serviceAccount.annotations` | `{}` | e.g. for IRSA/Workload Identity, if ever needed. |
 | `serviceAccount.name` | `""` | Defaults to the chart's fullname when empty; ignored (uses `default`) if `create` is `false`. |
 | `serviceAccount.automountServiceAccountToken` | `false` | The exporter only calls the Cloudflare API, never the Kubernetes API. |
 | `serviceMonitor.enabled` | `false` | Requires the Prometheus Operator CRDs. |
-| `serviceMonitor.interval` / `.scrapeTimeout` | `60s` / `30s` | |
+| `serviceMonitor.interval` / `.scrapeTimeout` | `150s` / `120s` | |
 | `resources` | `50m`/`64Mi` requests, `256Mi` limit | |
 | `podSecurityContext`, `securityContext` | non-root, read-only rootfs, all capabilities dropped | |
 | `nodeSelector`, `tolerations`, `affinity` | `{}` / `[]` / `{}` | |

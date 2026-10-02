@@ -68,10 +68,11 @@ func run(logger *slog.Logger) error {
 
 	cf := cloudflareapi.NewClient(cfg.APIToken)
 	coll := collector.New(cf, cfg.Discovery.Jobs, collector.Options{
-		Window:        *analyticsWindow,
-		Lag:           *analyticsLag,
-		QueryLimit:    *queryLimit,
-		ScrapeTimeout: cfg.Server.ScrapeTimeout,
+		Window:             *analyticsWindow,
+		Lag:                *analyticsLag,
+		QueryLimit:         *queryLimit,
+		ScrapeTimeout:      cfg.Server.ScrapeTimeout,
+		AccountConcurrency: cfg.Server.AccountConcurrency,
 	}, logger)
 
 	registry := prometheus.NewRegistry()

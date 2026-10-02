@@ -47,13 +47,22 @@ discovery:
 server:
   listenAddress: ":9199"
   metricsPath: "/metrics"
-  scrapeTimeout: 30s
+  scrapeTimeout: 120s        # bounds one whole scrape across every job/account/zone combined
+  accountConcurrency: 4      # accounts within a job scraped in parallel, sharing that budget
 ```
 
 A job's `metricGroups` also skips the corresponding Cloudflare API calls, not
 just the metrics. Zones are deduplicated across jobs: when two jobs select the
 same zone, the first job in config order claims it and its `metricGroups`
 apply — a later job's differing `metricGroups` are ignored for that zone.
+
+Every account in every job shares one `server.scrapeTimeout` budget for that
+scrape; `server.accountConcurrency` bounds how many accounts within a job run
+in parallel against that budget, rather than serially draining it. Any
+external Prometheus scrape timeout (a `prometheus.io/scrape-timeout`
+annotation, or a ServiceMonitor's `scrapeTimeout`) must stay at least as large
+as `server.scrapeTimeout`, or Prometheus cuts the connection before the
+exporter finishes.
 
 The Cloudflare API token is **not** read from this file — set it via the
 `CLOUDFLARE_API_TOKEN` environment variable (in Kubernetes, from a Secret; see the

@@ -44,6 +44,24 @@ discovery:
 	if cfg.Server.ListenAddress != ":9199" {
 		t.Errorf("default ListenAddress = %q, want %q", cfg.Server.ListenAddress, ":9199")
 	}
+	if cfg.Server.AccountConcurrency != 4 {
+		t.Errorf("default AccountConcurrency = %d, want 4", cfg.Server.AccountConcurrency)
+	}
+}
+
+func TestLoad_AccountConcurrencyMustBePositive(t *testing.T) {
+	t.Setenv(apiTokenEnvVar, "test-token")
+	path := writeConfig(t, `
+discovery:
+  jobs:
+    - name: x
+server:
+  accountConcurrency: 0
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for non-positive server.accountConcurrency, got nil")
+	}
 }
 
 func TestLoad_MissingAPIToken(t *testing.T) {

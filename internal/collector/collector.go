@@ -7,6 +7,8 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -60,6 +62,9 @@ type Options struct {
 	QueryLimit int
 	// ScrapeTimeout bounds one whole Collect call across all jobs.
 	ScrapeTimeout time.Duration
+	// AccountConcurrency bounds how many accounts within a job are scraped in
+	// parallel. <= 1 means sequential.
+	AccountConcurrency int
 }
 
 // Collector orchestrates discovery jobs and turns their results into
@@ -240,12 +245,60 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 // same metricGroups, or keep their zone sets disjoint.
 type scrape struct {
 	mintime, maxtime time.Time
-	zonesByAccount   map[string][]cloudflareapi.Zone
-	emitted          map[string]bool
+
+	// mu guards zonesByAccount, emitted and dns: accounts within a job are
+	// scraped concurrently (see Options.AccountConcurrency), and while zone
+	// IDs never collide across accounts, the maps themselves still need
+	// synchronized access.
+	mu             sync.Mutex
+	zonesByAccount map[string][]cloudflareapi.Zone
+	emitted        map[string]bool
 	// dns accumulates the account-scoped DNS gauges across jobs: two jobs can
 	// each select a different subset of the same account's zones, so the
 	// series is emitted once per account after every job has contributed.
 	dns map[string]*dnsAccountState
+}
+
+// zonesFor returns the cached zone list for accountID, or (nil, false) if
+// this scrape hasn't fetched it yet.
+func (s *scrape) zonesFor(accountID string) ([]cloudflareapi.Zone, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	zones, ok := s.zonesByAccount[accountID]
+	return zones, ok
+}
+
+func (s *scrape) setZonesFor(accountID string, zones []cloudflareapi.Zone) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.zonesByAccount[accountID] = zones
+}
+
+// claimZones marks every zone ID not yet emitted this scrape as emitted and
+// returns the subset actually claimed by this call.
+func (s *scrape) claimZones(zones []cloudflareapi.Zone) []cloudflareapi.Zone {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var claimed []cloudflareapi.Zone
+	for _, z := range zones {
+		if s.emitted[z.ID] {
+			continue
+		}
+		s.emitted[z.ID] = true
+		claimed = append(claimed, z)
+	}
+	return claimed
+}
+
+func (s *scrape) dnsState(accountID string) *dnsAccountState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.dns[accountID]
+	if st == nil {
+		st = &dnsAccountState{unmatched: make(map[cloudflareapi.DNSQueryGroup]struct{})}
+		s.dns[accountID] = st
+	}
+	return st
 }
 
 // dnsAccountState merges the DNS analytics outcome of every job that queried
@@ -319,28 +372,61 @@ func (c *Collector) collectJob(ctx context.Context, ch chan<- prometheus.Metric,
 		filters = append(filters, cloudflareapi.TagFilter{Key: f.Key, Value: f.Value, Negate: f.Negate})
 	}
 
+	limit := c.opts.AccountConcurrency
+	if limit <= 0 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+
+	var wg sync.WaitGroup
+	var errOnce sync.Once
+	var firstErr error
+	var failed atomic.Bool
+
 	seen := make(map[string]bool, len(accountIDs))
 	for _, accountID := range accountIDs {
 		if seen[accountID] {
 			continue
 		}
 		seen[accountID] = true
-		if err := c.collectAccount(ctx, ch, s, accountID, filters, job.Groups); err != nil {
-			return err
+
+		sem <- struct{}{}
+
+		// Stop admitting new accounts once any account in this job has
+		// failed fatally. Checked only after acquiring a slot, so with
+		// AccountConcurrency 1 this reproduces the original serial fail-fast
+		// exactly: acquiring the one slot means the previous account (and
+		// its error capture) has fully completed. With concurrency > 1 it's
+		// best-effort: accounts already admitted keep running rather than
+		// being cancelled mid-flight.
+		if failed.Load() {
+			<-sem
+			break
 		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if err := c.collectAccount(ctx, ch, s, accountID, filters, job.Groups); err != nil {
+				errOnce.Do(func() { firstErr = err })
+				failed.Store(true)
+			}
+		}()
 	}
-	return nil
+	wg.Wait()
+	return firstErr
 }
 
 func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Metric, s *scrape, accountID string, filters []cloudflareapi.TagFilter, groups config.MetricGroups) error {
-	zones, ok := s.zonesByAccount[accountID]
+	zones, ok := s.zonesFor(accountID)
 	if !ok {
 		var err error
 		zones, err = c.cf.ListZones(ctx, accountID)
 		if err != nil {
 			return err
 		}
-		s.zonesByAccount[accountID] = zones
+		s.setZonesFor(accountID, zones)
 	}
 
 	// Resource Tagging needs its own token permission. When searchTags are
@@ -361,18 +447,17 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 
 	// With search-tag filters configured, only zones the tag query matched are
 	// in scope; with none configured every zone in the account is in scope
-	// (tags map may still be sparse — not every zone need be tagged). Zones
-	// already emitted by an earlier job in this scrape are skipped.
-	var selected []cloudflareapi.Zone
+	// (tags map may still be sparse — not every zone need be tagged).
+	var tagMatched []cloudflareapi.Zone
 	for _, z := range zones {
-		if s.emitted[z.ID] {
-			continue
-		}
 		if _, tagged := tags[z.ID]; len(filters) > 0 && !tagged {
 			continue
 		}
-		selected = append(selected, z)
+		tagMatched = append(tagMatched, z)
 	}
+	// claimZones also skips zones already emitted by an earlier job in this
+	// scrape.
+	selected := s.claimZones(tagMatched)
 	if len(selected) == 0 {
 		return nil
 	}
@@ -382,7 +467,6 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 	for i, z := range selected {
 		zoneIDs[i] = z.ID
 		zoneByID[z.ID] = z
-		s.emitted[z.ID] = true
 
 		ch <- prometheus.MustNewConstMetric(c.zoneInfoDesc, prometheus.GaugeValue, 1, z.ID, z.Name, z.Account.ID, z.Account.Name, z.Status)
 		for k, v := range tags[z.ID] {
@@ -443,11 +527,7 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		// Groups are one row per (zone, query type, response code); Cloudflare
 		// truncates silently at the limit, which would undercount every DNS metric
 		// below, so surface it instead of reporting wrong numbers quietly.
-		st := s.dns[accountID]
-		if st == nil {
-			st = &dnsAccountState{unmatched: make(map[cloudflareapi.DNSQueryGroup]struct{})}
-			s.dns[accountID] = st
-		}
+		st := s.dnsState(accountID)
 		if len(dnsGroups) > 0 && len(dnsGroups) >= c.opts.QueryLimit {
 			c.logger.Warn("dns analytics result hit query limit, metrics are undercounted",
 				"account_id", accountID, "query_limit", c.opts.QueryLimit)

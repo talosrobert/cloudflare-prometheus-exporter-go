@@ -30,4 +30,11 @@ discovery:
 server:
   listenAddress: ":9199"
   metricsPath: "/metrics"
-  scrapeTimeout: 30s
+  # Bounds one whole scrape across every job/account/zone combined. An
+  # external Prometheus scrape timeout (annotation or ServiceMonitor) must
+  # stay >= this value, or Prometheus cuts the connection first.
+  scrapeTimeout: 120s
+  # How many accounts within a job are scraped in parallel; all accounts in a
+  # job share the scrapeTimeout budget above, so this is what keeps it from
+  # being spent serially as accounts/zones grow.
+  accountConcurrency: 4

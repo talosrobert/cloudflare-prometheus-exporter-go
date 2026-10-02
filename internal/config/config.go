@@ -89,6 +89,10 @@ type ServerConfig struct {
 	ListenAddress string        `yaml:"listenAddress"`
 	MetricsPath   string        `yaml:"metricsPath"`
 	ScrapeTimeout time.Duration `yaml:"scrapeTimeout"`
+	// AccountConcurrency bounds how many accounts within a discovery job are
+	// scraped in parallel. All accounts in a job otherwise share one
+	// ScrapeTimeout budget, so a serial scan degrades as accounts/zones grow.
+	AccountConcurrency int `yaml:"accountConcurrency"`
 }
 
 // Config is the fully loaded exporter configuration.
@@ -110,7 +114,8 @@ func defaults() Config {
 	var c Config
 	c.Server.ListenAddress = ":9199"
 	c.Server.MetricsPath = "/metrics"
-	c.Server.ScrapeTimeout = 30 * time.Second
+	c.Server.ScrapeTimeout = 120 * time.Second
+	c.Server.AccountConcurrency = 4
 	return c
 }
 
@@ -132,6 +137,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Server.ScrapeTimeout <= 0 {
 		return nil, fmt.Errorf("server.scrapeTimeout must be positive, got %s", cfg.Server.ScrapeTimeout)
+	}
+	if cfg.Server.AccountConcurrency <= 0 {
+		return nil, fmt.Errorf("server.accountConcurrency must be positive, got %d", cfg.Server.AccountConcurrency)
 	}
 	if len(cfg.Discovery.Jobs) == 0 {
 		return nil, fmt.Errorf("config must define at least one discovery.jobs entry")
