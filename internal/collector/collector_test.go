@@ -8,6 +8,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -30,6 +31,10 @@ type fakeClient struct {
 	wafGroups   []cloudflareapi.WAFEventGroup
 	errorGroups []cloudflareapi.ErrorGroup
 
+	// mu guards the call counters below: the collector scrapes accounts
+	// within a job concurrently, so tests exercising more than one account
+	// hit these from multiple goroutines.
+	mu                sync.Mutex
 	listZonesCalls    int
 	httpMetricsCalls  int
 	wafMetricsCalls   int
@@ -42,7 +47,9 @@ func (f *fakeClient) ListAccounts(_ context.Context) ([]cloudflareapi.Account, e
 }
 
 func (f *fakeClient) ListZones(_ context.Context, accountID string) ([]cloudflareapi.Zone, error) {
+	f.mu.Lock()
 	f.listZonesCalls++
+	f.mu.Unlock()
 	return f.zones[accountID], nil
 }
 
@@ -67,7 +74,9 @@ func matches(tags map[string]string, filters []cloudflareapi.TagFilter) bool {
 }
 
 func (f *fakeClient) FetchHTTPMetrics(_ context.Context, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.ZoneHTTPMetrics, error) {
+	f.mu.Lock()
 	f.httpMetricsCalls++
+	f.mu.Unlock()
 	var out []cloudflareapi.ZoneHTTPMetrics
 	for _, id := range zoneIDs {
 		if m, ok := f.metrics[id]; ok {
@@ -78,7 +87,9 @@ func (f *fakeClient) FetchHTTPMetrics(_ context.Context, zoneIDs []string, _, _ 
 }
 
 func (f *fakeClient) FetchWAFMetrics(_ context.Context, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.WAFEventGroup, error) {
+	f.mu.Lock()
 	f.wafMetricsCalls++
+	f.mu.Unlock()
 	wanted := make(map[string]bool, len(zoneIDs))
 	for _, id := range zoneIDs {
 		wanted[id] = true
@@ -93,7 +104,9 @@ func (f *fakeClient) FetchWAFMetrics(_ context.Context, zoneIDs []string, _, _ t
 }
 
 func (f *fakeClient) FetchDNSMetrics(_ context.Context, _ string, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.DNSQueryGroup, error) {
+	f.mu.Lock()
 	f.dnsMetricsCalls++
+	f.mu.Unlock()
 	wanted := make(map[string]bool, len(zoneIDs))
 	for _, id := range zoneIDs {
 		wanted[id] = true
@@ -108,7 +121,9 @@ func (f *fakeClient) FetchDNSMetrics(_ context.Context, _ string, zoneIDs []stri
 }
 
 func (f *fakeClient) FetchErrorMetrics(_ context.Context, zoneIDs []string, _, _ time.Time, _ int) ([]cloudflareapi.ErrorGroup, error) {
+	f.mu.Lock()
 	f.errorMetricsCalls++
+	f.mu.Unlock()
 	wanted := make(map[string]bool, len(zoneIDs))
 	for _, id := range zoneIDs {
 		wanted[id] = true
@@ -127,7 +142,7 @@ func newTestLogger() *slog.Logger {
 }
 
 func testOptions() Options {
-	return Options{Window: time.Minute, Lag: 5 * time.Minute, QueryLimit: 1000, ScrapeTimeout: 10 * time.Second}
+	return Options{Window: time.Minute, Lag: 5 * time.Minute, QueryLimit: 1000, ScrapeTimeout: 10 * time.Second, AccountConcurrency: 4}
 }
 
 func newFake() *fakeClient {
@@ -738,10 +753,11 @@ func (f *failingWAF) FetchWAFMetrics(_ context.Context, _ []string, _, _ time.Ti
 
 // A WAF fetch failure must behave like an HTTP-metrics failure (fatal for the
 // job), not like DNS/tags (fatal only for the current account, job keeps
-// going). Two accounts in one job make the difference observable: account
-// metrics already queued on the channel before the failure cannot be
-// retracted, but a fatal error must stop the job before it ever reaches the
-// second account.
+// going). Two accounts in one job with AccountConcurrency: 1 make the
+// difference observable: account metrics already queued on the channel
+// before the failure cannot be retracted, but a fatal error must stop the
+// job before it ever reaches the second account. With concurrency > 1 this
+// guarantee relaxes — see TestCollector_AccountFailureDoesNotBlockSiblings.
 func TestCollector_WAFErrorIsFatal(t *testing.T) {
 	acct2 := cloudflareapi.Account{ID: "acct2", Name: "Account Two"}
 	fc := newFake()
@@ -749,7 +765,9 @@ func TestCollector_WAFErrorIsFatal(t *testing.T) {
 	fc.zones["acct2"] = []cloudflareapi.Zone{
 		{ID: "zone-other", Name: "other.example.com", Status: "active", Account: acct2},
 	}
-	c := New(&failingWAF{fakeClient: fc}, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+	opts := testOptions()
+	opts.AccountConcurrency = 1
+	c := New(&failingWAF{fakeClient: fc}, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
 
 	out := gather(t, c)
 	if hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": "other.example.com"}) {
@@ -760,6 +778,90 @@ func TestCollector_WAFErrorIsFatal(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(c.scrapeErrors.WithLabelValues("all")); got != 1 {
 		t.Errorf("scrape_errors_total = %v, want 1", got)
+	}
+}
+
+// With AccountConcurrency > 1, accounts run independently: one account's
+// fatal error no longer prevents its siblings in the same job from being
+// scraped and emitting their own metrics. The job is still reported failed.
+func TestCollector_AccountFailureDoesNotBlockSiblings(t *testing.T) {
+	acct2 := cloudflareapi.Account{ID: "acct2", Name: "Account Two"}
+	fc := newFake()
+	fc.accounts = append(fc.accounts, acct2)
+	fc.zones["acct2"] = []cloudflareapi.Zone{
+		{ID: "zone-other", Name: "other.example.com", Status: "active", Account: acct2},
+	}
+	opts := testOptions()
+	opts.AccountConcurrency = 2
+	c := New(&failingWAF{fakeClient: fc}, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+
+	out := gather(t, c)
+	if !hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": "other.example.com"}) {
+		t.Error("acct2 should still be scraped in parallel despite acct1's fatal WAF error")
+	}
+	if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("all")); got != 0 {
+		t.Errorf("job_success = %v, want 0", got)
+	}
+	if got := testutil.ToFloat64(c.scrapeErrors.WithLabelValues("all")); got != 1 {
+		t.Errorf("scrape_errors_total = %v, want 1", got)
+	}
+}
+
+// concurrencyTrackingClient wraps fakeClient to record how many ListZones
+// calls were ever in flight at once, so AccountConcurrency can be verified
+// to actually bound (and actually use) parallelism, not just "still works".
+type concurrencyTrackingClient struct {
+	*fakeClient
+	mu          sync.Mutex
+	inFlight    int
+	maxInFlight int
+}
+
+func (f *concurrencyTrackingClient) ListZones(ctx context.Context, accountID string) ([]cloudflareapi.Zone, error) {
+	f.mu.Lock()
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
+	f.mu.Unlock()
+
+	time.Sleep(10 * time.Millisecond)
+
+	f.mu.Lock()
+	f.inFlight--
+	f.mu.Unlock()
+	return f.fakeClient.ListZones(ctx, accountID)
+}
+
+func TestCollector_AccountConcurrencyRespectsBound(t *testing.T) {
+	const numAccounts = 5
+	const limit = 2
+
+	fc := newFake()
+	fc.accounts = nil
+	accountIDs := make([]string, numAccounts)
+	for i := range numAccounts {
+		id := "acct-" + strings.Repeat("x", i+1)
+		accountIDs[i] = id
+	}
+	tracker := &concurrencyTrackingClient{fakeClient: fc}
+
+	opts := testOptions()
+	opts.AccountConcurrency = limit
+	job := config.DiscoveryJob{Name: "all", Accounts: accountIDs}
+	c := New(tracker, []config.DiscoveryJob{job}, opts, newTestLogger())
+
+	gather(t, c)
+
+	tracker.mu.Lock()
+	maxInFlight := tracker.maxInFlight
+	tracker.mu.Unlock()
+
+	if maxInFlight > limit {
+		t.Errorf("max concurrent ListZones calls = %d, want <= %d (AccountConcurrency)", maxInFlight, limit)
+	}
+	if maxInFlight < limit {
+		t.Errorf("max concurrent ListZones calls = %d, want %d (accounts never actually ran in parallel)", maxInFlight, limit)
 	}
 }
 
@@ -961,8 +1063,8 @@ func (f *failingError) FetchErrorMetrics(_ context.Context, _ []string, _, _ tim
 }
 
 // An error-metrics fetch failure must be fatal like WAF/HTTP, not tolerated
-// like DNS/tags — same two-account technique as TestCollector_WAFErrorIsFatal
-// to make the difference observable.
+// like DNS/tags — same two-account, AccountConcurrency: 1 technique as
+// TestCollector_WAFErrorIsFatal to make the difference observable.
 func TestCollector_ErrorMetricsErrorIsFatal(t *testing.T) {
 	acct2 := cloudflareapi.Account{ID: "acct2", Name: "Account Two"}
 	fc := newFake()
@@ -970,7 +1072,9 @@ func TestCollector_ErrorMetricsErrorIsFatal(t *testing.T) {
 	fc.zones["acct2"] = []cloudflareapi.Zone{
 		{ID: "zone-other", Name: "other.example.com", Status: "active", Account: acct2},
 	}
-	c := New(&failingError{fakeClient: fc}, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+	opts := testOptions()
+	opts.AccountConcurrency = 1
+	c := New(&failingError{fakeClient: fc}, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
 
 	out := gather(t, c)
 	if hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": "other.example.com"}) {
