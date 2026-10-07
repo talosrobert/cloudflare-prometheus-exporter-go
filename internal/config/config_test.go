@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, contents string) string {
@@ -47,6 +48,12 @@ discovery:
 	if cfg.Server.AccountConcurrency != 4 {
 		t.Errorf("default AccountConcurrency = %d, want 4", cfg.Server.AccountConcurrency)
 	}
+	if cfg.Server.RequestTimeout != 30*time.Second {
+		t.Errorf("default RequestTimeout = %s, want 30s", cfg.Server.RequestTimeout)
+	}
+	if cfg.Server.DNSRequestTimeout != 120*time.Second {
+		t.Errorf("default DNSRequestTimeout = %s, want 120s", cfg.Server.DNSRequestTimeout)
+	}
 }
 
 func TestLoad_AccountConcurrencyMustBePositive(t *testing.T) {
@@ -61,6 +68,68 @@ server:
 
 	if _, err := Load(path); err == nil {
 		t.Fatal("expected error for non-positive server.accountConcurrency, got nil")
+	}
+}
+
+func TestLoad_RequestTimeoutMustBePositive(t *testing.T) {
+	t.Setenv(apiTokenEnvVar, "test-token")
+	path := writeConfig(t, `
+discovery:
+  jobs:
+    - name: x
+server:
+  requestTimeout: 0s
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for non-positive server.requestTimeout, got nil")
+	}
+}
+
+func TestLoad_DNSRequestTimeoutMustBePositive(t *testing.T) {
+	t.Setenv(apiTokenEnvVar, "test-token")
+	path := writeConfig(t, `
+discovery:
+  jobs:
+    - name: x
+server:
+  dnsRequestTimeout: 0s
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for non-positive server.dnsRequestTimeout, got nil")
+	}
+}
+
+func TestLoad_RequestTimeoutMustNotExceedScrapeTimeout(t *testing.T) {
+	t.Setenv(apiTokenEnvVar, "test-token")
+	path := writeConfig(t, `
+discovery:
+  jobs:
+    - name: x
+server:
+  scrapeTimeout: 10s
+  requestTimeout: 20s
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for server.requestTimeout exceeding server.scrapeTimeout, got nil")
+	}
+}
+
+func TestLoad_DNSRequestTimeoutMustNotExceedScrapeTimeout(t *testing.T) {
+	t.Setenv(apiTokenEnvVar, "test-token")
+	path := writeConfig(t, `
+discovery:
+  jobs:
+    - name: x
+server:
+  scrapeTimeout: 10s
+  dnsRequestTimeout: 20s
+`)
+
+	if _, err := Load(path); err == nil {
+		t.Fatal("expected error for server.dnsRequestTimeout exceeding server.scrapeTimeout, got nil")
 	}
 }
 

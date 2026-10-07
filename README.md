@@ -49,6 +49,8 @@ server:
   metricsPath: "/metrics"
   scrapeTimeout: 120s        # bounds one whole scrape across every job/account/zone combined
   accountConcurrency: 4      # accounts within a job scraped in parallel, sharing that budget
+  requestTimeout: 30s        # bounds a single HTTP/WAF/Errors analytics API call
+  dnsRequestTimeout: 120s    # bounds the DNS analytics call, which is structurally heavier (see below)
 ```
 
 A job's `metricGroups` also skips the corresponding Cloudflare API calls, not
@@ -63,6 +65,16 @@ external Prometheus scrape timeout (a `prometheus.io/scrape-timeout`
 annotation, or a ServiceMonitor's `scrapeTimeout`) must stay at least as large
 as `server.scrapeTimeout`, or Prometheus cuts the connection before the
 exporter finishes.
+
+Each of the four analytics calls an account makes (HTTP, WAF, Errors, DNS) is
+also individually bounded, by `server.requestTimeout` for HTTP/WAF/Errors and
+`server.dnsRequestTimeout` for DNS, and they run concurrently so a slow one
+doesn't serialize on top of the others. DNS analytics queries an account-wide
+dataset (`dnsAnalyticsAdaptiveGroups`) rather than the per-zone datasets the
+other three use, which makes it structurally heavier and, for some accounts,
+noticeably slower — hence its own, longer, timeout. Both must not exceed
+`server.scrapeTimeout`. `cloudflare_exporter_api_call_duration_seconds` (see
+below) reports actual per-call latency if you need to tune either value.
 
 The Cloudflare API token is **not** read from this file — set it via the
 `CLOUDFLARE_API_TOKEN` environment variable (in Kubernetes, from a Secret; see the
@@ -153,6 +165,7 @@ Exporter self-metrics:
 | `cloudflare_exporter_job_success` | `job` | 1 if the job's last scrape succeeded, else 0 |
 | `cloudflare_exporter_scrape_errors_total` | `job` | Cumulative failed scrapes per job |
 | `cloudflare_exporter_api_errors_total` | `account_id`, `api` | Failed calls to an optional, separately permissioned API (`dns_analytics`, `resource_tagging`); non-fatal |
+| `cloudflare_exporter_api_call_duration_seconds` | `account_id`, `api` | Duration of one account's HTTP/WAF/Errors/DNS analytics call (`api` is `http`, `waf`, `errors`, or `dns_analytics`), recorded whether it succeeded or timed out |
 | `cloudflare_exporter_dns_result_truncated` | `account_id` | 1 if DNS results hit `-query-limit`, meaning DNS metrics are undercounted |
 | `cloudflare_exporter_dns_unmatched_groups` | `account_id` | DNS rows skipped because their zone was not in scope (see internal zones below) |
 

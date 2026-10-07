@@ -58,9 +58,13 @@ type Client struct {
 	gql *GraphQLClient
 }
 
+// clientHTTPTimeout is only a backstop for a connection that hangs without the
+// context noticing; the real per-call budgets live in collector.Options.
+const clientHTTPTimeout = 5 * time.Minute
+
 // NewClient builds a Client authenticated with apiToken.
 func NewClient(apiToken string) *Client {
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := &http.Client{Timeout: clientHTTPTimeout}
 	return &Client{
 		api: cloudflare.NewClient(
 			option.WithAPIToken(apiToken),

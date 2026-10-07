@@ -1,5 +1,10 @@
 # Project conventions
 
+## Comments
+- Explain why, not what: the code already says what it does. Skip the comment entirely when the code reads clearly on its own.
+- Two lines maximum. Anything that needs more belongs in the pull request description or the commit message, not in the source.
+- No history: don't record what the code used to do, which incident prompted the change, or when it was added. `git log` and `git blame` are authoritative for that.
+
 ## Metrics
 - Prometheus metric names must follow https://prometheus.io/docs/practices/naming/#metric-names (namespace prefix, base units, `_total`/`_info`/`_ratio` suffixes, no label values baked into the name).
 - Cloudflare `*Adaptive*` GraphQL datasets are sampled: always request `avg { sampleInterval }` and scale `count` with `estimatedCount` (internal/cloudflareapi/sampling.go). Confirm new dataset/field names by live schema introspection before using them.

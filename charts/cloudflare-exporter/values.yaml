@@ -38,6 +38,12 @@ exporter:
   # How many accounts within a job are scraped in parallel; all accounts in a
   # job share the scrapeTimeout budget above.
   accountConcurrency: 4
+  # Bounds a single HTTP/WAF/Errors analytics API call, independent of
+  # scrapeTimeout.
+  requestTimeout: 30s
+  # Bounds the DNS analytics call, which queries a heavier account-wide dataset
+  # than the per-zone calls and so gets a longer budget.
+  dnsRequestTimeout: 120s
   # Rendered as-is into config.yaml's discovery.jobs; see the main README for
   # the searchTags/accounts shape.
   discovery:

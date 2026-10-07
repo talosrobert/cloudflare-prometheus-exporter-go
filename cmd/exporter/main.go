@@ -73,6 +73,8 @@ func run(logger *slog.Logger) error {
 		QueryLimit:         *queryLimit,
 		ScrapeTimeout:      cfg.Server.ScrapeTimeout,
 		AccountConcurrency: cfg.Server.AccountConcurrency,
+		RequestTimeout:     cfg.Server.RequestTimeout,
+		DNSRequestTimeout:  cfg.Server.DNSRequestTimeout,
 	}, logger)
 
 	registry := prometheus.NewRegistry()
