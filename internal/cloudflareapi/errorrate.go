@@ -93,7 +93,9 @@ type errorMetricsResponse struct {
 // ErrorGroup is one (zone, edge status, origin status, country, host) bucket
 // of request volume for the requested window. OriginStatus is 0 when the
 // origin was never contacted for that row. Count, EdgeRequestBytes, and
-// EdgeResponseBytes are sampling-corrected estimates, not raw sampled sums.
+// EdgeResponseBytes are sampling-corrected estimates, not raw sampled sums —
+// except on a LowConfidence row, where they are the raw sampled sums, since
+// scaling too few records produces a wilder number than not scaling at all.
 type ErrorGroup struct {
 	ZoneTag               string
 	EdgeStatus            int
@@ -101,6 +103,7 @@ type ErrorGroup struct {
 	Country               string
 	Host                  string
 	Count                 float64
+	LowConfidence         bool
 	AvgOriginDurationMs   float64
 	EdgeRequestBytes      float64
 	EdgeResponseBytes     float64
@@ -132,16 +135,22 @@ func (c *Client) FetchErrorMetrics(ctx context.Context, zoneIDs []string, mintim
 	var out []ErrorGroup
 	for _, z := range resp.Viewer.Zones {
 		for _, g := range z.HTTPRequestsAdaptiveRows {
+			interval := g.Avg.SampleInterval
+			low := lowConfidence(g.Count, interval)
+			if low {
+				interval = 1
+			}
 			out = append(out, ErrorGroup{
 				ZoneTag:               z.ZoneTag,
 				EdgeStatus:            g.Dimensions.EdgeResponseStatus,
 				OriginStatus:          g.Dimensions.OriginResponseStatus,
 				Country:               g.Dimensions.ClientCountryName,
 				Host:                  g.Dimensions.ClientRequestHost,
-				Count:                 estimatedCount(g.Count, g.Avg.SampleInterval),
+				Count:                 estimatedCount(g.Count, interval),
+				LowConfidence:         low,
 				AvgOriginDurationMs:   g.Avg.OriginResponseDurationMs,
-				EdgeRequestBytes:      estimatedCount(g.Sum.EdgeRequestBytes, g.Avg.SampleInterval),
-				EdgeResponseBytes:     estimatedCount(g.Sum.EdgeResponseBytes, g.Avg.SampleInterval),
+				EdgeRequestBytes:      estimatedCount(g.Sum.EdgeRequestBytes, interval),
+				EdgeResponseBytes:     estimatedCount(g.Sum.EdgeResponseBytes, interval),
 				WAFAttackScoreClass:   g.Dimensions.WAFAttackScoreClass,
 				BotManagementDecision: g.Dimensions.BotManagementDecision,
 				VerifiedBotCategory:   g.Dimensions.VerifiedBotCategory,

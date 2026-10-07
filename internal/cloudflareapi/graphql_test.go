@@ -2,6 +2,7 @@ package cloudflareapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -203,7 +204,7 @@ func TestClient_FetchErrorMetrics(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","httpRequestsAdaptiveGroups":[
 			{"count":3,"avg":{"originResponseDurationMs":120,"sampleInterval":1},"sum":{"edgeRequestBytes":150,"edgeResponseBytes":900},"dimensions":{"edgeResponseStatus":500,"originResponseStatus":500,"clientCountryName":"US","clientRequestHTTPHost":"example.com","wafAttackScoreClass":"attack","botManagementDecision":"automated","verifiedBotCategory":""}},
-			{"count":5,"avg":{"originResponseDurationMs":-1,"sampleInterval":10},"sum":{"edgeRequestBytes":50,"edgeResponseBytes":200},"dimensions":{"edgeResponseStatus":403,"originResponseStatus":0,"clientCountryName":"FR","clientRequestHTTPHost":"example.com","wafAttackScoreClass":"clean","botManagementDecision":"verified_bot","verifiedBotCategory":"Search Engine Crawler"}}
+			{"count":50,"avg":{"originResponseDurationMs":-1,"sampleInterval":10},"sum":{"edgeRequestBytes":50,"edgeResponseBytes":200},"dimensions":{"edgeResponseStatus":403,"originResponseStatus":0,"clientCountryName":"FR","clientRequestHTTPHost":"example.com","wafAttackScoreClass":"clean","botManagementDecision":"verified_bot","verifiedBotCategory":"Search Engine Crawler"}}
 		]}]}}}`))
 	})
 
@@ -226,14 +227,61 @@ func TestClient_FetchErrorMetrics(t *testing.T) {
 	if got[1].OriginStatus != 0 || got[1].AvgOriginDurationMs != -1 {
 		t.Errorf("unexpected second group (origin not contacted): %+v", got[1])
 	}
-	if got[1].Count != 50 {
-		t.Errorf("sampled group Count = %v, want 50 (5 records × sampleInterval 10)", got[1].Count)
+	if got[1].Count != 500 {
+		t.Errorf("sampled group Count = %v, want 500 (50 records × sampleInterval 10)", got[1].Count)
+	}
+	if got[0].LowConfidence || got[1].LowConfidence {
+		t.Errorf("LowConfidence = %v, %v, want false, false (sampleInterval 1 is exact, and 50 records clear the threshold)", got[0].LowConfidence, got[1].LowConfidence)
 	}
 	if got[1].EdgeRequestBytes != 500 || got[1].EdgeResponseBytes != 2000 {
 		t.Errorf("sampled group bytes = %+v, want EdgeRequestBytes=500 EdgeResponseBytes=2000 (raw × sampleInterval 10)", got[1])
 	}
 	if got[1].WAFAttackScoreClass != "clean" || got[1].BotManagementDecision != "verified_bot" || got[1].VerifiedBotCategory != "Search Engine Crawler" {
 		t.Errorf("unexpected second group security fields: %+v", got[1])
+	}
+}
+
+// Scaling a few records by a large sampleInterval is what turns a handful of
+// requests into a six-figure estimate, so those rows are left unscaled.
+func TestFetchErrorMetrics_LowConfidenceRowsNotScaled(t *testing.T) {
+	cases := []struct {
+		name              string
+		count             float64
+		sampleInterval    float64
+		wantCount         float64
+		wantBytes         float64
+		wantLowConfidence bool
+	}{
+		{"thin and heavily sampled", 2, 2915000, 2, 10, true},
+		{"thin but exact", 3, 1, 3, 10, false},
+		{"thin, no sampleInterval reported", 3, 0, 3, 10, false},
+		{"at the threshold", 10, 100, 1000, 1000, false},
+		{"just below the threshold", 9, 100, 9, 10, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := fmt.Sprintf(`{"data":{"viewer":{"zones":[{"zoneTag":"zone-1","httpRequestsAdaptiveGroups":[
+				{"count":%v,"avg":{"originResponseDurationMs":5,"sampleInterval":%v},"sum":{"edgeRequestBytes":10,"edgeResponseBytes":10},"dimensions":{"edgeResponseStatus":404,"originResponseStatus":0,"clientCountryName":"AT","clientRequestHTTPHost":"example.com","wafAttackScoreClass":"clean","botManagementDecision":"likely_human","verifiedBotCategory":""}}
+			]}]}}}`, tc.count, tc.sampleInterval)
+			c := newTestGraphQL(t, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(body))
+			})
+
+			got, err := c.FetchErrorMetrics(t.Context(), []string{"zone-1"}, time.Now().Add(-time.Minute), time.Now(), 100)
+			if err != nil {
+				t.Fatalf("FetchErrorMetrics() error = %v", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("got %d groups, want 1: %+v", len(got), got)
+			}
+			if got[0].Count != tc.wantCount || got[0].LowConfidence != tc.wantLowConfidence {
+				t.Errorf("Count = %v, LowConfidence = %v, want %v, %v", got[0].Count, got[0].LowConfidence, tc.wantCount, tc.wantLowConfidence)
+			}
+			// bytes must follow the same decision as the count.
+			if got[0].EdgeRequestBytes != tc.wantBytes || got[0].EdgeResponseBytes != tc.wantBytes {
+				t.Errorf("bytes = %v, %v, want %v", got[0].EdgeRequestBytes, got[0].EdgeResponseBytes, tc.wantBytes)
+			}
+		})
 	}
 }
 

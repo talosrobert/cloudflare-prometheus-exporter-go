@@ -156,6 +156,7 @@ Labels on every zone metric: `zone_id`, `zone`.
 | `cloudflare_zone_error_ratio` | `side` | 4xx/5xx error ratio, by side: `edge` (edge 4xx/5xx responses / total requests) or `origin` (origin 4xx/5xx responses / requests that reached the origin, excludes edge cache hits, edge blocks, and anything else never sent to the origin) |
 | `cloudflare_zone_origin_response_duration_seconds` | | Average origin response duration, weighted by request count, across requests that reached the origin |
 | `cloudflare_zone_error_result_truncated` | (zone labels) | 1 if that zone's error/latency analytics result hit `-query-limit` in this scrape |
+| `cloudflare_zone_low_confidence_rows` | (zone labels) | How many sampled rows this scrape were left unscaled for resting on too few records (see [Sampling](#sampling)) |
 
 Exporter self-metrics:
 
@@ -201,6 +202,19 @@ returned a group with `count=44502` and `sampleInterval≈1.18`, i.e. ~18% more 
 than the raw count. The HTTP request metrics come from `httpRequests1mGroups`, a
 non-sampled rollup, and are exact. The `*_result_truncated` gauges count raw rows against
 `-query-limit`, unaffected by sampling.
+
+That estimate is only as good as the sample it rests on. A group holding two sampled records
+and a `sampleInterval` in the millions extrapolates to millions of requests that never
+happened, for one scrape, and is back to normal on the next. Every metric built on this
+dataset is exposed, not just the error ones, since they all sum the same scaled row counts.
+
+So a row carrying fewer than 10 records is not scaled at all: its count and bytes are
+published as the raw sampled sums. That undercounts the row, but the error is bounded by the
+sampling rate, whereas the extrapolation it replaces is not bounded by anything. Rows with a
+`sampleInterval` of 1 are exact rather than estimated, so they are always published as-is, no
+matter how few records they hold. `cloudflare_zone_low_confidence_rows` counts the unscaled
+rows per zone: a persistently high value means the window is too short for the sampling rate
+that zone currently gets.
 
 ### Partial-permission behaviour
 
