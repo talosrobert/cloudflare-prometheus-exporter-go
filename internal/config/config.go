@@ -93,6 +93,12 @@ type ServerConfig struct {
 	// scraped in parallel. All accounts in a job otherwise share one
 	// ScrapeTimeout budget, so a serial scan degrades as accounts/zones grow.
 	AccountConcurrency int `yaml:"accountConcurrency"`
+	// RequestTimeout bounds a single HTTP/WAF/Errors analytics API call,
+	// independent of ScrapeTimeout.
+	RequestTimeout time.Duration `yaml:"requestTimeout"`
+	// DNSRequestTimeout bounds the DNS analytics call, which queries a heavier
+	// account-wide dataset than the per-zone calls and so gets its own budget.
+	DNSRequestTimeout time.Duration `yaml:"dnsRequestTimeout"`
 }
 
 // Config is the fully loaded exporter configuration.
@@ -116,6 +122,8 @@ func defaults() Config {
 	c.Server.MetricsPath = "/metrics"
 	c.Server.ScrapeTimeout = 120 * time.Second
 	c.Server.AccountConcurrency = 4
+	c.Server.RequestTimeout = 30 * time.Second
+	c.Server.DNSRequestTimeout = 120 * time.Second
 	return c
 }
 
@@ -140,6 +148,18 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Server.AccountConcurrency <= 0 {
 		return nil, fmt.Errorf("server.accountConcurrency must be positive, got %d", cfg.Server.AccountConcurrency)
+	}
+	if cfg.Server.RequestTimeout <= 0 {
+		return nil, fmt.Errorf("server.requestTimeout must be positive, got %s", cfg.Server.RequestTimeout)
+	}
+	if cfg.Server.DNSRequestTimeout <= 0 {
+		return nil, fmt.Errorf("server.dnsRequestTimeout must be positive, got %s", cfg.Server.DNSRequestTimeout)
+	}
+	if cfg.Server.RequestTimeout > cfg.Server.ScrapeTimeout {
+		return nil, fmt.Errorf("server.requestTimeout (%s) must not exceed server.scrapeTimeout (%s)", cfg.Server.RequestTimeout, cfg.Server.ScrapeTimeout)
+	}
+	if cfg.Server.DNSRequestTimeout > cfg.Server.ScrapeTimeout {
+		return nil, fmt.Errorf("server.dnsRequestTimeout (%s) must not exceed server.scrapeTimeout (%s)", cfg.Server.DNSRequestTimeout, cfg.Server.ScrapeTimeout)
 	}
 	if len(cfg.Discovery.Jobs) == 0 {
 		return nil, fmt.Errorf("config must define at least one discovery.jobs entry")

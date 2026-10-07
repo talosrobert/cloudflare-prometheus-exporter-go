@@ -5,6 +5,7 @@ package collector
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -65,6 +66,12 @@ type Options struct {
 	// AccountConcurrency bounds how many accounts within a job are scraped in
 	// parallel. <= 1 means sequential.
 	AccountConcurrency int
+	// RequestTimeout bounds a single HTTP/WAF/Errors analytics API call. <= 0
+	// means no bound beyond whatever ScrapeTimeout leaves remaining.
+	RequestTimeout time.Duration
+	// DNSRequestTimeout bounds the DNS analytics call, which queries a heavier
+	// account-wide dataset than the per-zone calls. <= 0 means no bound.
+	DNSRequestTimeout time.Duration
 }
 
 // Collector orchestrates discovery jobs and turns their results into
@@ -81,9 +88,10 @@ type Collector struct {
 	opts   Options
 	logger *slog.Logger
 
-	scrapeErrors *prometheus.CounterVec
-	jobSuccess   *prometheus.GaugeVec
-	apiErrors    *prometheus.CounterVec
+	scrapeErrors    *prometheus.CounterVec
+	jobSuccess      *prometheus.GaugeVec
+	apiErrors       *prometheus.CounterVec
+	apiCallDuration *prometheus.HistogramVec
 
 	windowDesc   *prometheus.Desc
 	zoneInfoDesc *prometheus.Desc
@@ -157,6 +165,12 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 			Name:      "exporter_api_errors_total",
 			Help:      "Failed calls to an optional, separately permissioned Cloudflare API, by account; the remaining metrics are still exported",
 		}, []string{"account_id", "api"}),
+		apiCallDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: namespace,
+			Name:      "exporter_api_call_duration_seconds",
+			Help:      "Duration of a single Cloudflare analytics API call made while collecting one account's metrics, by account and API",
+			Buckets:   []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 45, 60, 90, 120},
+		}, []string{"account_id", "api"}),
 
 		windowDesc:   desc("exporter_analytics_window_seconds", "Length of the analytics window each zone metric is summed over", nil),
 		zoneInfoDesc: desc("zone_info", "Zone discovery info, value is always 1", withLabel(zoneLabels, "account_id", "account", "status")),
@@ -213,6 +227,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	c.scrapeErrors.Describe(ch)
 	c.jobSuccess.Describe(ch)
 	c.apiErrors.Describe(ch)
+	c.apiCallDuration.Describe(ch)
 	for _, d := range c.allDescs() {
 		ch <- d
 	}
@@ -352,6 +367,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.scrapeErrors.Collect(ch)
 	c.jobSuccess.Collect(ch)
 	c.apiErrors.Collect(ch)
+	c.apiCallDuration.Collect(ch)
 }
 
 func (c *Collector) collectJob(ctx context.Context, ch chan<- prometheus.Metric, s *scrape, job config.DiscoveryJob) error {
@@ -474,80 +490,116 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		}
 	}
 
+	// The four analytics calls run concurrently: one slow call (DNS, see
+	// Options.DNSRequestTimeout) must not add its latency to the other three.
+	var wg sync.WaitGroup
+	var httpErr, wafErr, errorsErr error
+
 	if !groups.DisableZone {
-		metrics, err := c.cf.FetchHTTPMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
-		if err != nil {
-			return err
-		}
-		for _, m := range metrics {
-			if !m.HasData {
-				continue
+		wg.Go(func() {
+			metrics, err := fetchTimed(ctx, c, accountID, "http", c.opts.RequestTimeout,
+				func(ctx context.Context) ([]cloudflareapi.ZoneHTTPMetrics, error) {
+					return c.cf.FetchHTTPMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+				})
+			if err != nil {
+				httpErr = err
+				return
 			}
-			zone, ok := zoneByID[m.ZoneTag]
-			if !ok {
-				continue
+			for _, m := range metrics {
+				if !m.HasData {
+					continue
+				}
+				zone, ok := zoneByID[m.ZoneTag]
+				if !ok {
+					continue
+				}
+				c.emitZoneMetrics(ch, zone, m)
 			}
-			c.emitZoneMetrics(ch, zone, m)
-		}
+		})
 	}
 
 	if !groups.DisableFirewall {
-		// firewallEventsAdaptiveGroups needs no permission beyond what HTTP
-		// analytics already requires (verified live), so a failure here is fatal
-		// for the account just like FetchHTTPMetrics — unlike DNS/tags below.
-		wafGroups, err := c.cf.FetchWAFMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
-		if err != nil {
-			return err
-		}
-		c.emitWAFMetrics(ch, zoneByID, wafGroups, c.opts.QueryLimit)
+		wg.Go(func() {
+			// firewallEventsAdaptiveGroups needs no permission beyond what HTTP
+			// analytics already requires (verified live), so a failure here is fatal.
+			wafGroups, err := fetchTimed(ctx, c, accountID, "waf", c.opts.RequestTimeout,
+				func(ctx context.Context) ([]cloudflareapi.WAFEventGroup, error) {
+					return c.cf.FetchWAFMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+				})
+			if err != nil {
+				wafErr = err
+				return
+			}
+			c.emitWAFMetrics(ch, zoneByID, wafGroups, c.opts.QueryLimit)
+		})
 	}
 
 	if !groups.DisableErrors {
-		// httpRequestsAdaptiveGroups needs no permission beyond what HTTP analytics
-		// already requires (verified live), so a failure here is fatal for the
-		// account just like FetchHTTPMetrics/FetchWAFMetrics.
-		errorGroups, err := c.cf.FetchErrorMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
-		if err != nil {
-			return err
-		}
-		c.emitErrorMetrics(ch, zoneByID, errorGroups, c.opts.QueryLimit)
+		wg.Go(func() {
+			// httpRequestsAdaptiveGroups needs no permission beyond what HTTP analytics
+			// already requires (verified live), so a failure here is fatal.
+			errorGroups, err := fetchTimed(ctx, c, accountID, "errors", c.opts.RequestTimeout,
+				func(ctx context.Context) ([]cloudflareapi.ErrorGroup, error) {
+					return c.cf.FetchErrorMetrics(ctx, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+				})
+			if err != nil {
+				errorsErr = err
+				return
+			}
+			c.emitErrorMetrics(ch, zoneByID, errorGroups, c.opts.QueryLimit)
+		})
 	}
 
 	if !groups.DisableDNS {
-		// DNS analytics needs its own API token permission that Cloudflare does not
-		// clearly document, so a token good enough for everything else still gets
-		// "not authorized for that account" here. Treat it as non-fatal: record it
-		// and keep the metrics that did work.
-		dnsGroups, err := c.cf.FetchDNSMetrics(ctx, accountID, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
-		if err != nil {
-			c.logger.Warn("dns analytics unavailable", "account_id", accountID, "error", err)
-			c.apiErrors.WithLabelValues(accountID, "dns_analytics").Inc()
-			return nil
-		}
-		// Groups are one row per (zone, query type, response code); Cloudflare
-		// truncates silently at the limit, which would undercount every DNS metric
-		// below, so surface it instead of reporting wrong numbers quietly.
-		st := s.dnsState(accountID)
-		if len(dnsGroups) > 0 && len(dnsGroups) >= c.opts.QueryLimit {
-			c.logger.Warn("dns analytics result hit query limit, metrics are undercounted",
-				"account_id", accountID, "query_limit", c.opts.QueryLimit)
-			st.truncated = true
-		}
-		unmatched := c.emitDNSMetrics(ch, zoneByID, dnsGroups)
-		if len(unmatched) > 0 {
-			// Cloudflare's zone list omits type=internal zones (workers.dev and
-			// friends) while DNS analytics still reports their traffic, so those
-			// rows have no zone to attach to. Report it rather than dropping the
-			// data silently.
-			c.logger.Warn("dns analytics rows skipped, zone not in scope for this scrape",
-				"account_id", accountID, "rows", len(unmatched), "example_zone_id", unmatched[0].ZoneTag)
-		}
-		for _, g := range unmatched {
-			st.unmatched[g] = struct{}{}
-		}
+		wg.Go(func() {
+			// DNS analytics needs its own API token permission that Cloudflare does not
+			// clearly document, so a token good enough for everything else fails here.
+			dnsGroups, err := fetchTimed(ctx, c, accountID, "dns_analytics", c.opts.DNSRequestTimeout,
+				func(ctx context.Context) ([]cloudflareapi.DNSQueryGroup, error) {
+					return c.cf.FetchDNSMetrics(ctx, accountID, zoneIDs, s.mintime, s.maxtime, c.opts.QueryLimit)
+				})
+			if err != nil {
+				c.logger.Warn("dns analytics unavailable", "account_id", accountID, "error", err)
+				c.apiErrors.WithLabelValues(accountID, "dns_analytics").Inc()
+				return
+			}
+			// Cloudflare truncates group results at the limit silently, which would
+			// undercount every DNS metric below.
+			st := s.dnsState(accountID)
+			if len(dnsGroups) > 0 && len(dnsGroups) >= c.opts.QueryLimit {
+				c.logger.Warn("dns analytics result hit query limit, metrics are undercounted",
+					"account_id", accountID, "query_limit", c.opts.QueryLimit)
+				st.truncated = true
+			}
+			unmatched := c.emitDNSMetrics(ch, zoneByID, dnsGroups)
+			if len(unmatched) > 0 {
+				// Cloudflare's zone list omits type=internal zones (workers.dev and
+				// friends) whose DNS traffic it still reports, so they match no zone.
+				c.logger.Warn("dns analytics rows skipped, zone not in scope for this scrape",
+					"account_id", accountID, "rows", len(unmatched), "example_zone_id", unmatched[0].ZoneTag)
+			}
+			for _, g := range unmatched {
+				st.unmatched[g] = struct{}{}
+			}
+		})
 	}
 
-	return nil
+	wg.Wait()
+	return errors.Join(httpErr, wafErr, errorsErr)
+}
+
+// fetchTimed bounds one analytics call by d and records how long it took,
+// success or failure. d <= 0 leaves ctx's own deadline as the only bound.
+func fetchTimed[T any](ctx context.Context, c *Collector, accountID, api string, d time.Duration, fn func(context.Context) (T, error)) (T, error) {
+	if d > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, d)
+		defer cancel()
+	}
+	start := time.Now()
+	v, err := fn(ctx)
+	c.apiCallDuration.WithLabelValues(accountID, api).Observe(time.Since(start).Seconds())
+	return v, err
 }
 
 // emitWAFMetrics aggregates firewall/WAF event rows by zone and by each

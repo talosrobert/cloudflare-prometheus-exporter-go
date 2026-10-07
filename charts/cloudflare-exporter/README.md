@@ -33,6 +33,8 @@ first — the chart does not build or push images itself.
 | `exporter.metricsPath` | `/metrics` | Written into `config.yaml`'s `server.metricsPath`. |
 | `exporter.scrapeTimeout` | `120s` | Written into `config.yaml`'s `server.scrapeTimeout`. Keep `service.annotations`' `/scrape-timeout` and `serviceMonitor.scrapeTimeout` >= this value. |
 | `exporter.accountConcurrency` | `4` | Written into `config.yaml`'s `server.accountConcurrency` — how many accounts within a job are scraped in parallel. |
+| `exporter.requestTimeout` | `30s` | Written into `config.yaml`'s `server.requestTimeout` — bounds a single HTTP/WAF/Errors analytics API call, independent of `scrapeTimeout`. |
+| `exporter.dnsRequestTimeout` | `120s` | Written into `config.yaml`'s `server.dnsRequestTimeout` — bounds the DNS analytics call specifically; it queries a structurally heavier, account-wide dataset, so it gets a longer budget than `requestTimeout`. |
 | `exporter.discovery.jobs` | one `production-zones` job, `env=production` | Rendered verbatim into `config.yaml`'s `discovery.jobs` — see the main [README](../../README.md#configuration) for the `searchTags`/`accounts` shape. |
 | `service.type` | `ClusterIP` | |
 | `service.port` | `9199` | Also the container port and `config.yaml`'s `listenAddress`. |

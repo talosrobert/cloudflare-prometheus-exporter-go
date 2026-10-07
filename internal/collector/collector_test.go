@@ -142,7 +142,11 @@ func newTestLogger() *slog.Logger {
 }
 
 func testOptions() Options {
-	return Options{Window: time.Minute, Lag: 5 * time.Minute, QueryLimit: 1000, ScrapeTimeout: 10 * time.Second, AccountConcurrency: 4}
+	return Options{
+		Window: time.Minute, Lag: 5 * time.Minute, QueryLimit: 1000,
+		ScrapeTimeout: 10 * time.Second, AccountConcurrency: 4,
+		RequestTimeout: 5 * time.Second, DNSRequestTimeout: 5 * time.Second,
+	}
 }
 
 func newFake() *fakeClient {
@@ -869,6 +873,132 @@ type failingDNS struct{ *fakeClient }
 
 func (f *failingDNS) FetchDNSMetrics(_ context.Context, _ string, _ []string, _, _ time.Time, _ int) ([]cloudflareapi.DNSQueryGroup, error) {
 	return nil, errors.New("not authorized for that account")
+}
+
+// fetchConcurrencyTrackingClient records how many of the four per-account
+// analytics fetches were ever in flight at once.
+type fetchConcurrencyTrackingClient struct {
+	*fakeClient
+	mu          sync.Mutex
+	inFlight    int
+	maxInFlight int
+}
+
+func (f *fetchConcurrencyTrackingClient) begin() {
+	f.mu.Lock()
+	f.inFlight++
+	if f.inFlight > f.maxInFlight {
+		f.maxInFlight = f.inFlight
+	}
+	f.mu.Unlock()
+}
+
+func (f *fetchConcurrencyTrackingClient) end() {
+	f.mu.Lock()
+	f.inFlight--
+	f.mu.Unlock()
+}
+
+func (f *fetchConcurrencyTrackingClient) FetchHTTPMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.ZoneHTTPMetrics, error) {
+	f.begin()
+	time.Sleep(10 * time.Millisecond)
+	defer f.end()
+	return f.fakeClient.FetchHTTPMetrics(ctx, zoneIDs, mintime, maxtime, limit)
+}
+
+func (f *fetchConcurrencyTrackingClient) FetchWAFMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.WAFEventGroup, error) {
+	f.begin()
+	time.Sleep(10 * time.Millisecond)
+	defer f.end()
+	return f.fakeClient.FetchWAFMetrics(ctx, zoneIDs, mintime, maxtime, limit)
+}
+
+func (f *fetchConcurrencyTrackingClient) FetchErrorMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.ErrorGroup, error) {
+	f.begin()
+	time.Sleep(10 * time.Millisecond)
+	defer f.end()
+	return f.fakeClient.FetchErrorMetrics(ctx, zoneIDs, mintime, maxtime, limit)
+}
+
+func (f *fetchConcurrencyTrackingClient) FetchDNSMetrics(ctx context.Context, accountID string, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.DNSQueryGroup, error) {
+	f.begin()
+	time.Sleep(10 * time.Millisecond)
+	defer f.end()
+	return f.fakeClient.FetchDNSMetrics(ctx, accountID, zoneIDs, mintime, maxtime, limit)
+}
+
+// The four analytics fetches for one account must run concurrently, so a slow
+// one never adds its latency to the other three.
+func TestCollector_PerAccountFetchesRunConcurrently(t *testing.T) {
+	tracker := &fetchConcurrencyTrackingClient{fakeClient: newFake()}
+	c := New(tracker, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	gather(t, c)
+
+	tracker.mu.Lock()
+	maxInFlight := tracker.maxInFlight
+	tracker.mu.Unlock()
+
+	const wantConcurrent = 4 // HTTP, WAF, Errors, DNS all enabled by default
+	if maxInFlight != wantConcurrent {
+		t.Errorf("max concurrent analytics fetches for one account = %d, want %d (collectAccount should run them in parallel)", maxInFlight, wantConcurrent)
+	}
+}
+
+// blockingDNS hangs in FetchDNSMetrics until its context is cancelled, like a
+// Cloudflare DNS query running past DNSRequestTimeout.
+type blockingDNS struct{ *fakeClient }
+
+func (f *blockingDNS) FetchDNSMetrics(ctx context.Context, _ string, _ []string, _, _ time.Time, _ int) ([]cloudflareapi.DNSQueryGroup, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// A stuck DNS call must fail on its own timeout instead of draining the much
+// larger shared ScrapeTimeout budget the rest of the scrape needs.
+func TestCollector_DNSTimeoutDoesNotBlockOtherMetrics(t *testing.T) {
+	opts := testOptions()
+	opts.ScrapeTimeout = 5 * time.Second
+	opts.DNSRequestTimeout = 20 * time.Millisecond
+	c := New(&blockingDNS{fakeClient: newFake()}, []config.DiscoveryJob{{Name: "all"}}, opts, newTestLogger())
+
+	start := time.Now()
+	out := gather(t, c)
+	elapsed := time.Since(start)
+
+	if elapsed > time.Second {
+		t.Errorf("Collect() took %s, want well under ScrapeTimeout (%s): DNSRequestTimeout should bound the stuck DNS call", elapsed, opts.ScrapeTimeout)
+	}
+	if !hasSeries(out, "cloudflare_zone_requests", map[string]string{"zone": "prod.example.com"}) {
+		t.Error("HTTP metrics must survive a DNS call stuck past its own timeout")
+	}
+	if got := testutil.ToFloat64(c.apiErrors.WithLabelValues("acct1", "dns_analytics")); got != 1 {
+		t.Errorf("api_errors_total{api=dns_analytics} = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("all")); got != 1 {
+		t.Errorf("job_success = %v, want 1 (DNS failure is non-fatal)", got)
+	}
+}
+
+// Each analytics call records its duration once per account per scrape, so
+// the timeouts above can be tuned from real latency data.
+func TestCollector_APICallDurationObserved(t *testing.T) {
+	c := New(newFake(), []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+	gather(t, c)
+
+	for _, api := range []string{"http", "waf", "errors", "dns_analytics"} {
+		m, ok := c.apiCallDuration.WithLabelValues("acct1", api).(prometheus.Metric)
+		if !ok {
+			t.Fatalf("api %s: observer does not implement prometheus.Metric", api)
+		}
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("api %s: Write() error = %v", api, err)
+		}
+		if got := pb.GetHistogram().GetSampleCount(); got != 1 {
+			t.Errorf("api %s: sample count = %d, want 1", api, got)
+		}
+	}
 }
 
 type failingTags struct{ *fakeClient }
