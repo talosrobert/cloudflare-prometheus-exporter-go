@@ -133,6 +133,7 @@ type Collector struct {
 	wafTruncatedDesc     *prometheus.Desc
 
 	customerErrorDesc          *prometheus.Desc
+	errorLowConfidenceDesc     *prometheus.Desc
 	errorRatioDesc             *prometheus.Desc
 	originResponseDurationDesc *prometheus.Desc
 	errorTruncatedDesc         *prometheus.Desc
@@ -212,6 +213,7 @@ func New(cf cloudflareClient, jobs []config.DiscoveryJob, opts Options, logger *
 		wafTruncatedDesc:     desc("zone_firewall_result_truncated", "1 if the zone's WAF event result hit the query limit, meaning WAF metrics are undercounted", zoneLabels),
 
 		customerErrorDesc:          desc("zone_requests_customer_error", windowHelp("Requests with an edge 4xx/5xx response, by status, country, and host — high cardinality, one series per distinct (status, country, host) combination seen in the window"), withLabel(zoneLabels, "status", "country", "host")),
+		errorLowConfidenceDesc:     desc("zone_low_confidence_rows", "Sampled httpRequestsAdaptiveGroups rows this scrape left unscaled because too few records backed them; their counts and bytes are raw sample sums, so every metric fed by that dataset undercounts them rather than risking an estimate orders of magnitude too high", zoneLabels),
 		errorRatioDesc:             desc("zone_error_ratio", windowHelp("4xx/5xx error ratio, by side: edge (errors / total requests) or origin (errors / requests that reached the origin, excluding edge cache hits, edge blocks, and other requests never sent to the origin)"), withLabel(zoneLabels, "side")),
 		originResponseDurationDesc: desc("zone_origin_response_duration_seconds", windowHelp("Average origin response duration, weighted by request count, across requests that reached the origin"), zoneLabels),
 		errorTruncatedDesc:         desc("zone_error_result_truncated", "1 if the zone's error/latency analytics result hit the query limit, meaning error metrics are undercounted", zoneLabels),
@@ -243,7 +245,7 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 		c.threatsCountryDesc, c.threatsTypeDesc, c.pageviewsDesc, c.uniquesDesc, c.cacheHitRatioDesc,
 		c.dnsQueriesDesc, c.dnsQueriesTypeDesc, c.dnsQueriesResponseCodeDesc, c.dnsTruncatedDesc, c.dnsUnmatchedDesc,
 		c.wafEventsDesc, c.wafEventsActionDesc, c.wafEventsSourceDesc, c.wafEventsRuleDesc, c.wafEventsCountryDesc, c.wafTruncatedDesc,
-		c.customerErrorDesc, c.errorRatioDesc, c.originResponseDurationDesc, c.errorTruncatedDesc,
+		c.customerErrorDesc, c.errorLowConfidenceDesc, c.errorRatioDesc, c.originResponseDurationDesc, c.errorTruncatedDesc,
 		c.requestsHostDesc, c.bandwidthHostDesc, c.wafAttackScoreClassDesc, c.botManagementDesc,
 	}
 }
@@ -659,6 +661,7 @@ type botKey struct{ zoneID, decision, botCategory string }
 func (c *Collector) emitErrorMetrics(ch chan<- prometheus.Metric, zoneByID map[string]cloudflareapi.Zone, groups []cloudflareapi.ErrorGroup, queryLimit int) {
 	rowCount := make(map[string]int)
 	customerErrors := make(map[customerErrorKey]float64)
+	lowConfidenceRows := make(map[string]float64)
 	originTotal := make(map[string]float64)
 	originErrors := make(map[string]float64)
 	durationWeightedSum := make(map[string]float64)
@@ -674,6 +677,9 @@ func (c *Collector) emitErrorMetrics(ch chan<- prometheus.Metric, zoneByID map[s
 			continue
 		}
 		rowCount[zoneID]++
+		if g.LowConfidence {
+			lowConfidenceRows[zoneID]++
+		}
 
 		if g.EdgeStatus >= 400 {
 			customerErrors[customerErrorKey{zoneID, strconv.Itoa(g.EdgeStatus), g.Country, g.Host}] += g.Count
@@ -704,6 +710,7 @@ func (c *Collector) emitErrorMetrics(ch chan<- prometheus.Metric, zoneByID map[s
 			truncated = 1
 		}
 		ch <- prometheus.MustNewConstMetric(c.errorTruncatedDesc, prometheus.GaugeValue, truncated, zone.ID, zone.Name)
+		ch <- prometheus.MustNewConstMetric(c.errorLowConfidenceDesc, prometheus.GaugeValue, lowConfidenceRows[zoneID], zone.ID, zone.Name)
 
 		if total := originTotal[zoneID]; total > 0 {
 			ch <- prometheus.MustNewConstMetric(c.errorRatioDesc, prometheus.GaugeValue, originErrors[zoneID]/total, zone.ID, zone.Name, "origin")

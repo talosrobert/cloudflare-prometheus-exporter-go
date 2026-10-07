@@ -13,3 +13,13 @@ func estimatedCount(count, sampleInterval float64) float64 {
 	}
 	return count * sampleInterval
 }
+
+// minRawSamplesForConfidence is the fewest sampled records whose scaled total
+// is worth believing; below it the relative error (~1/√n) swamps the estimate.
+const minRawSamplesForConfidence = 10
+
+// lowConfidence reports whether scaling this row would multiply a handful of
+// records into an estimate that swings by orders of magnitude between windows.
+func lowConfidence(count, sampleInterval float64) bool {
+	return sampleInterval > 1 && count < minRawSamplesForConfidence
+}

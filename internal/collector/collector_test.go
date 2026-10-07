@@ -1088,6 +1088,43 @@ func TestCollector_CustomerErrorMetrics(t *testing.T) {
 	if hasSeries(out, "cloudflare_zone_requests_customer_error", map[string]string{"status": "200"}) {
 		t.Error("non-error edge status must not produce a customer_error series")
 	}
+
+	if got, ok := metricValue(out, "cloudflare_zone_low_confidence_rows", map[string]string{"zone": "prod.example.com", "zone_id": "zone-prod"}); !ok {
+		t.Error("expected a low_confidence_rows series for zone-prod")
+	} else if got != 0 {
+		t.Errorf("low_confidence_rows = %v, want 0 (no newFake() row is flagged)", got)
+	}
+}
+
+// Rows the API layer left unscaled still feed every aggregate — only the
+// per-zone gauge marks them, one per flagged row.
+func TestCollector_LowConfidenceRowsCounted(t *testing.T) {
+	fc := newFake()
+	fc.errorGroups = append(fc.errorGroups,
+		cloudflareapi.ErrorGroup{ZoneTag: "zone-prod", EdgeStatus: 404, OriginStatus: 0, Country: "AT", Host: "prod.example.com", Count: 2, LowConfidence: true, AvgOriginDurationMs: -1, EdgeResponseBytes: 40},
+		cloudflareapi.ErrorGroup{ZoneTag: "zone-prod", EdgeStatus: 404, OriginStatus: 0, Country: "AT", Host: "prod.example.com", Count: 1, LowConfidence: true, AvgOriginDurationMs: -1, EdgeResponseBytes: 20},
+	)
+	c := New(fc, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+
+	if got, ok := metricValue(out, "cloudflare_zone_low_confidence_rows", map[string]string{"zone": "prod.example.com", "zone_id": "zone-prod"}); !ok {
+		t.Error("expected a low_confidence_rows series for zone-prod")
+	} else if got != 2 {
+		t.Errorf("low_confidence_rows = %v, want 2 (one per flagged row, not per aggregated key)", got)
+	}
+
+	// both flagged rows share one (status, country, host) key: 2 + 1.
+	if got, ok := metricValue(out, "cloudflare_zone_requests_customer_error", map[string]string{
+		"zone": "prod.example.com", "zone_id": "zone-prod", "status": "404", "country": "AT", "host": "prod.example.com",
+	}); !ok || got != 3 {
+		t.Errorf("customer_error{status=404,country=AT} = %v, ok=%v, want 3 — unscaled rows still count", got, ok)
+	}
+
+	// zones that saw no flagged row still report 0, like the truncation gauge.
+	if got, ok := metricValue(out, "cloudflare_zone_low_confidence_rows", map[string]string{"zone": "dev.example.com", "zone_id": "zone-dev"}); ok && got != 0 {
+		t.Errorf("low_confidence_rows{zone-dev} = %v, want 0", got)
+	}
 }
 
 // cloudflare_zone_requests_host and cloudflare_zone_bandwidth_host_bytes sum
