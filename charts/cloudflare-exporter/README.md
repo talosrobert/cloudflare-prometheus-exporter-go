@@ -47,6 +47,7 @@ first — the chart does not build or push images itself.
 | `serviceAccount.automountServiceAccountToken` | `false` | The exporter only calls the Cloudflare API, never the Kubernetes API. |
 | `serviceMonitor.enabled` | `false` | Requires the Prometheus Operator CRDs. |
 | `serviceMonitor.interval` / `.scrapeTimeout` | `150s` / `120s` | |
+| `serviceMonitor.honorLabels` | `true` | Keeps the `job` label of the exporter metrics, which holds the discovery job name. With `false`, Prometheus renames it to `exported_job`. |
 | `resources` | `50m`/`64Mi` requests, `256Mi` limit | |
 | `podSecurityContext`, `securityContext` | non-root, read-only rootfs, all capabilities dropped | |
 | `nodeSelector`, `tolerations`, `affinity` | `{}` / `[]` / `{}` | |

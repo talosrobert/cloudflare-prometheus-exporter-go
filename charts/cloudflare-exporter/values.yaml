@@ -76,6 +76,9 @@ serviceMonitor:
   enabled: false
   interval: 150s
   scrapeTimeout: 120s
+  # The exporter metrics carry their own `job` label (the discovery job name).
+  # Without this, Prometheus renames that label to `exported_job`.
+  honorLabels: true
   labels: {}
   annotations: {}
 

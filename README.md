@@ -236,9 +236,12 @@ If you do not use the Prometheus Operator `ServiceMonitor`, add this `scrape_con
 ```yaml
 scrape_configs:
   - job_name: cloudflare-exporter
+    honor_labels: true
     static_configs:
       - targets: ["cloudflare-exporter:9199"]
 ```
+
+Keep `honor_labels: true`. Some exporter metrics have their own `job` label with the discovery job name. Without this setting, Prometheus renames that label to `exported_job`.
 
 ## Development
 
