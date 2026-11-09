@@ -520,16 +520,21 @@ func (c *Collector) collectAccount(ctx context.Context, ch chan<- prometheus.Met
 		return nil
 	}
 
-	zoneIDs := make([]string, len(selected))
+	zoneIDs := make([]string, 0, len(selected))
 	zoneByID := make(map[string]cloudflareapi.Zone, len(selected))
-	for i, z := range selected {
-		zoneIDs[i] = z.ID
-		zoneByID[z.ID] = z
-
+	for _, z := range selected {
 		ch <- prometheus.MustNewConstMetric(c.zoneInfoDesc, prometheus.GaugeValue, 1, z.ID, z.Name, z.Account.ID, z.Account.Name, z.Status)
 		for k, v := range tags[z.ID] {
 			ch <- prometheus.MustNewConstMetric(c.tagInfoDesc, prometheus.GaugeValue, 1, z.ID, z.Name, k, v)
 		}
+
+		// Cloudflare refuses analytics for a zone that is not active.
+		// One refused zone fails the whole batched query for the account.
+		if z.Status != "active" {
+			continue
+		}
+		zoneIDs = append(zoneIDs, z.ID)
+		zoneByID[z.ID] = z
 	}
 
 	// zone_info/zone_tags_info above describe state, not a window, so only the

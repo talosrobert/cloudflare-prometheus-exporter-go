@@ -295,6 +295,40 @@ func TestCollector_TagFiltering(t *testing.T) {
 	}
 }
 
+// refusesZone fails the HTTP fetch like Cloudflare does when a batch holds a zone that is not active.
+type refusesZone struct {
+	*fakeClient
+	zoneID string
+}
+
+func (f *refusesZone) FetchHTTPMetrics(ctx context.Context, zoneIDs []string, mintime, maxtime time.Time, limit int) ([]cloudflareapi.ZoneHTTPMetrics, error) {
+	if slices.Contains(zoneIDs, f.zoneID) {
+		return nil, errors.New("zone does not have access to the path")
+	}
+	return f.fakeClient.FetchHTTPMetrics(ctx, zoneIDs, mintime, maxtime, limit)
+}
+
+func TestCollector_InactiveZoneSkipsAnalytics(t *testing.T) {
+	fc := newFake()
+	fc.zones["acct1"] = append(fc.zones["acct1"],
+		cloudflareapi.Zone{ID: "zone-pending", Name: "pending.example.com", Status: "pending", Account: fc.accounts[0]})
+	c := New(&refusesZone{fakeClient: fc, zoneID: "zone-pending"}, []config.DiscoveryJob{{Name: "all"}}, testOptions(), newTestLogger())
+
+	out := gather(t, c)
+	if got := testutil.ToFloat64(c.jobSuccess.WithLabelValues("all")); got != 1 {
+		t.Errorf("job_success = %v, want 1", got)
+	}
+	if !hasSeries(out, "cloudflare_zone_info", map[string]string{"zone": "pending.example.com", "status": "pending"}) {
+		t.Error("expected zone_info for the pending zone")
+	}
+	if hasSeries(out, "cloudflare_zone_firewall_result_truncated", map[string]string{"zone": "pending.example.com"}) {
+		t.Error("expected no analytics series for the pending zone")
+	}
+	if !hasSeries(out, "cloudflare_zone_firewall_result_truncated", map[string]string{"zone": "prod.example.com"}) {
+		t.Error("expected analytics series for the active zone")
+	}
+}
+
 func TestCollector_NoFiltersScrapesAllZones(t *testing.T) {
 	job := config.DiscoveryJob{Name: "all"}
 	c := New(newFake(), []config.DiscoveryJob{job}, testOptions(), newTestLogger())

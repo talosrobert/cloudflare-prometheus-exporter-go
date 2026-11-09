@@ -83,7 +83,7 @@ Every zone metric has the labels `zone_id` and `zone`.
 
 | Metric | Extra labels | Description |
 |--------|--------------|-------------|
-| `cloudflare_zone_info` | `account_id`, `account`, `status` | Discovered zone. The value is always 1 |
+| `cloudflare_zone_info` | `account_id`, `account`, `status` | Discovered zone. The value is always 1. Only zones with the status `active` get analytics metrics, because Cloudflare refuses analytics for other zones |
 | `cloudflare_zone_tags_info` | `tag_key`, `tag_value` | One series for each resource tag on the zone. The value is always 1 |
 | `cloudflare_zone_requests` | | Requests |
 | `cloudflare_zone_requests_cached` | | Cached requests |
